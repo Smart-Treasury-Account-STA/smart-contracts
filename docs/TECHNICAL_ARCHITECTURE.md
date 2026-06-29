@@ -334,12 +334,14 @@ Integrated, not built:
 - TypeScript client generation — the SDK starts from the Stellar CLI's native `contract bindings typescript` code generation for typed, simulate/sign/submit-ready contract clients, rather than a hand-written client layer.
 - Relayer transaction building, RPC simulation/submission, and status polling — built on the official `@stellar/stellar-sdk` and documented RPC methods (Decision 3), not hand-built equivalents. The relayer remains self-operated, not a managed third-party service, so the no-authority trust boundary and full operational visibility from Decision 3 are unaffected.
 
-Net-new onchain logic STA funds:
+Net-new onchain logic STA funds — what is uniquely new here, beyond wallet approvals, signer rules, and treasury automation as generic concepts:
 
-- `PolicyEngine`: asset, recipient, amount, and risk validation pinned to a versioned policy state, so a later policy change cannot silently alter the semantics of automation that was already approved under an earlier version. A signer-approval layer alone does not provide this.
-- `IntentRegistry`: a canonical, replay-safe state machine for scheduled and recurring treasury execution — parent intents, child execution IDs, ledger-bound execution windows, and deterministic cancellation and expiry. This is bounded, audit-grade treasury automation with explicit per-execution replay protection, not a generic scheduler and not something existing Soroban passkey or multisig wallet contracts provide today.
-- `RecoveryManager` controls: pause/freeze plus guardian-quorum, ledger-delayed recovery that is explicitly separated from day-to-day spend authority, so recovering the account cannot be used to bypass spending policy.
-- Narrow execution adapters (`TransferAdapter`, `SplitAdapter`) that allowlist exact preauthorized actions, so an approved signature can never be reinterpreted into a broader or different onchain action than the one reviewed.
+- `PolicyEngine`: asset, recipient, amount, and risk validation pinned to a versioned policy state, so a later policy change cannot silently alter the semantics of automation that was already approved under an earlier version. A signer-approval layer alone does not provide this — it is new policy-versioning logic, not signer math.
+- `IntentRegistry`: a canonical, replay-safe state machine for scheduled and recurring treasury execution — parent intents, child execution IDs, ledger-bound execution windows, and deterministic cancellation and expiry. This is bounded, audit-grade treasury automation with explicit per-execution replay protection bound to Soroban ledger sequence, not a generic scheduler and not something existing Soroban passkey or multisig wallet contracts provide today.
+- `RecoveryManager` controls: pause/freeze plus guardian-quorum, ledger-delayed recovery that is explicitly separated from day-to-day spend authority, so recovering the account cannot be used to bypass spending policy — a property a flat signer-threshold model does not have on its own.
+- Narrow execution adapters (`TransferAdapter`, `SplitAdapter`) that allowlist exact preauthorized actions, so an approved signature can never be reinterpreted into a broader or different onchain action than the one reviewed — this is what keeps "signer approval" from silently becoming "approval of anything."
+
+In short: wallet approvals and signer-weight thresholds are the access-control layer, and they resemble standard multisig math. The funded engineering work is everything above that layer — version-pinned policy, replay-protected scheduled execution, recovery separated from spend authority, and exact-action adapter allowlisting — which is what does not exist as reusable Soroban infrastructure today.
 
 Budget framing: the request is not funding the construction of a passkey/smart-wallet product or a generic multisig — that authentication layer is integrated. It funds the policy, replay-protected automation, and recovery layer built on top of it, which is the part of STA that does not already exist as reusable Soroban infrastructure.
 
@@ -603,15 +605,6 @@ flowchart TB
     SA -->|"preauthorize exact split"| SPA
     TA --> SAC
     SPA --> SAC
-
-    classDef root fill:#e3f2fd,stroke:#1565c0,color:#111;
-    classDef module fill:#f1f8e9,stroke:#558b2f,color:#111;
-    classDef adapter fill:#fce4ec,stroke:#ad1457,color:#111;
-    classDef asset fill:#fffde7,stroke:#f9a825,color:#111;
-    class SA root;
-    class PE,IR,CV,RM module;
-    class TA,SPA adapter;
-    class SAC asset;
 ```
 
 Diagram explanation:
