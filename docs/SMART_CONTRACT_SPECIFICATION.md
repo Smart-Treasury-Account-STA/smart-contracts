@@ -23,7 +23,7 @@ The repository includes a focused PoC implementation of selected contract respon
 | SmartAccount | `contracts/smart_account_poc` | signer records, weights, thresholds, payment validation, nonce replay protection, pause/freeze state |
 | PolicyEngine | `contracts/policy_registry_poc` | asset rules, recipient rules, amount caps, policy version checks |
 | IntentRegistry | `contracts/intent_registry_poc` | scheduled intent records, executor-gated execution marking, ledger-based execution windows, child execution replay protection |
-| RecoveryManager | `contracts/recovery_guard_poc` | guardian records, authenticated guardian approvals, delayed recovery requests, approval counting, ledger-based finalization checks |
+| RecoveryManager | `contracts/recovery_guard_poc` | guardian records, guardian removal, authenticated guardian approvals, delayed recovery requests, approval counting, ledger-based finalization checks |
 
 The remaining production modules, including real SAC transfer execution, adapter dispatch, full `__check_auth`, SDK, relayer, dApp, deployment scripts, and monitoring, are specified as part of the complete STA architecture.
 
