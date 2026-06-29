@@ -5,7 +5,7 @@
 | Product | Smart Treasury Account (STA) |
 | Network | Stellar / Soroban |
 | Asset model | Stellar Asset Contract (SAC) |
-| Primary wallets | Freighter and xBull through Stellar Wallets Kit |
+| Primary wallets | Freighter and xBull through Stellar Wallets Kit; passkey signing via an integrated Soroban passkey toolkit, not a custom-built verifier |
 | Frontend framework | Scaffold Stellar |
 | Architecture level | Full technical design for contracts, dApp, TypeScript SDK, relayer, verification, deployment, and security controls |
 
@@ -279,15 +279,15 @@ These references establish the core integration assumptions:
 
 The following decisions remove ambiguity for implementation.
 
-### Decision 1: Wallet-first validation, passkey-capable production architecture
+### Decision 1: Integrate an existing passkey toolkit instead of building a custom WebAuthn signer path
 
-STA uses a staged signer strategy:
+STA uses a staged signer strategy that favors integration over net-new cryptographic build-out:
 
 1. The testnet validation flow uses Freighter and xBull wallet signing with Ed25519 signer records, plus scoped session keys for delegated operations.
-2. The production architecture remains passkey-capable through a P256/WebAuthn signer path in `SmartAccount`.
-3. The P256/WebAuthn path requires a focused compatibility spike covering Stellar SDK support, wallet UX, payload normalization, and onchain verification cost.
+2. The production passkey path integrates an existing Soroban secp256r1/WebAuthn smart-wallet toolkit — for example `passkey-kit` (github.com/kalepail/passkey-kit) or OpenZeppelin's Soroban smart-account WebAuthn contracts — instead of implementing a new P256/WebAuthn verifier, credential-registration flow, or key-management layer from scratch.
+3. Integration work is limited to a compatibility spike covering signer-record binding to the integrated verifier, wallet UX, payload normalization against the STA signature envelope, and onchain verification cost — not net-new cryptographic verifier implementation. The specific toolkit is selected during this spike based on audit history, contract upgrade policy, and license fit; it is not pinned here.
 
-This decision demonstrates Stellar-native treasury flows with available wallet tooling while preserving the stronger long-term UX promised by contract accounts.
+This decision demonstrates Stellar-native treasury flows with available wallet tooling while preserving the stronger long-term UX promised by contract accounts. See Decision 4 for the full build-vs-integrate budget breakdown.
 
 ### Decision 2: IntentRegistry is a core module
 
@@ -319,6 +319,29 @@ The relayer responsibilities are:
 - index execution results
 
 OpenZeppelin Relayer or another managed relayer is out of V1 scope. Any relayer implementation MUST preserve the same no-authority trust boundary. A custom relayer gives the team full visibility into Soroban simulation, auth handling, transaction assembly, retries, and replay failure modes during the security-hardening phase.
+
+### Decision 4: Budget scope — what STA builds versus what STA integrates
+
+STA's funded engineering scope is deliberately limited to the treasury-control layer that does not already exist as reusable Stellar/Soroban infrastructure. This decision exists to make the build cost legible against what is integrated, not rebuilt.
+
+Integrated, not built:
+
+- Passkey/WebAuthn signer verification — integrated per Decision 1, not built as a custom verifier.
+- Wallet connection and signing UX — integrated through Stellar Wallets Kit (Freighter, xBull).
+- The asset interface itself — integrated through the standard Stellar Asset Contract, not a custom token model.
+- Transaction simulation, fee calculation, and submission — integrated through Stellar RPC.
+- Admin/owner gating and pause/freeze state — integrated from OpenZeppelin's audited Stellar Soroban Contracts library (`stellar-access` for Ownable/AccessControl, `stellar-contract-utils` for Pausable) instead of being implemented and security-reviewed from scratch in each contract module.
+- TypeScript client generation — the SDK starts from the Stellar CLI's native `contract bindings typescript` code generation for typed, simulate/sign/submit-ready contract clients, rather than a hand-written client layer.
+- Relayer transaction building, RPC simulation/submission, and status polling — built on the official `@stellar/stellar-sdk` and documented RPC methods (Decision 3), not hand-built equivalents. The relayer remains self-operated, not a managed third-party service, so the no-authority trust boundary and full operational visibility from Decision 3 are unaffected.
+
+Net-new onchain logic STA funds:
+
+- `PolicyEngine`: asset, recipient, amount, and risk validation pinned to a versioned policy state, so a later policy change cannot silently alter the semantics of automation that was already approved under an earlier version. A signer-approval layer alone does not provide this.
+- `IntentRegistry`: a canonical, replay-safe state machine for scheduled and recurring treasury execution — parent intents, child execution IDs, ledger-bound execution windows, and deterministic cancellation and expiry. This is bounded, audit-grade treasury automation with explicit per-execution replay protection, not a generic scheduler and not something existing Soroban passkey or multisig wallet contracts provide today.
+- `RecoveryManager` controls: pause/freeze plus guardian-quorum, ledger-delayed recovery that is explicitly separated from day-to-day spend authority, so recovering the account cannot be used to bypass spending policy.
+- Narrow execution adapters (`TransferAdapter`, `SplitAdapter`) that allowlist exact preauthorized actions, so an approved signature can never be reinterpreted into a broader or different onchain action than the one reviewed.
+
+Budget framing: the request is not funding the construction of a passkey/smart-wallet product or a generic multisig — that authentication layer is integrated. It funds the policy, replay-protected automation, and recovery layer built on top of it, which is the part of STA that does not already exist as reusable Soroban infrastructure.
 
 ## 5. System Context
 
@@ -781,11 +804,11 @@ The signer model supports three practical signing paths:
    - The SmartAccount signer record stores the wallet public key as an Ed25519 signer.
    - This is the lowest integration-risk validation path because it aligns with available wallet behavior.
 
-2. Passkey/P256 signer path
-   - The app creates or registers a passkey credential.
-   - The SmartAccount stores a signer record bound to the P256/WebAuthn public key and credential metadata hash.
-   - `__check_auth` verifies the P256/WebAuthn assertion or a normalized signed payload.
-   - This is the production signer path after the wallet Ed25519 and session-key flows are validated.
+2. Passkey/P256 signer path (integrated, not custom-built)
+   - The app creates or registers a passkey credential through an integrated passkey toolkit's existing WebAuthn registration flow, rather than a custom-built credential pipeline.
+   - The SmartAccount stores a signer record bound to the P256/WebAuthn public key and credential metadata hash produced by the integrated toolkit.
+   - `__check_auth` delegates P256/WebAuthn assertion verification to the integrated passkey verifier contract; STA does not implement its own secp256r1/WebAuthn signature verification.
+   - This is the production signer path after the wallet Ed25519 and session-key flows are validated, and it carries materially lower implementation risk and cost than a from-scratch verifier.
 
 3. Scoped session key path
    - A primary signer authorizes creation of a temporary Ed25519 session key.

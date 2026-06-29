@@ -51,7 +51,7 @@ Demonstrates scheduled treasury state:
 
 Demonstrates recovery-oriented controls:
 
-- guardian registration
+- guardian registration and removal
 - delayed recovery request opening
 - authenticated guardian approval counting
 - duplicate approval rejection
@@ -71,6 +71,14 @@ The PoC does not include:
 - production dApp
 - deployment scripts
 - monitoring and indexer services
+
+## Known Limitations
+
+These are specific, named gaps in the current PoC, called out explicitly rather than left for a reviewer to discover:
+
+- `smart_account_poc::validate_payment` counts approver weights against stored `SignerRecord`s, but does not call `require_auth()` on the approvers themselves — there is no cryptographic binding yet between the caller and the supplied approver list. This contract demonstrates the threshold-counting algorithm, not authenticated multisig approval; real signer authentication is deferred to the production `__check_auth` implementation (see `SMART_CONTRACT_SPECIFICATION.md`, Section 2).
+- `smart_account_poc::freeze()` has no corresponding `unfreeze()`. This is intentional, not an oversight: unfreezing is meant to happen only as the outcome of a completed recovery (guardian threshold plus timelock in `recovery_guard_poc`), not as a second admin-gated toggle that would let the same potentially compromised admin undo an emergency freeze. The production `RecoveryManager` integration is what restores normal operation.
+- `recovery_guard_poc::finalize_recovery` is permissionless by design (anyone may call it once threshold and timelock are satisfied) — this is the standard "anyone can finalize after conditions are met" pattern, not a missing access check.
 
 ## Security Interpretation
 

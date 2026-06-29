@@ -11,7 +11,7 @@ The full technical design is documented in `../docs/TECHNICAL_ARCHITECTURE.md` a
 | `smart_account_poc` | treasury account initialization, signer records, signer weights, approval thresholds, policy version binding, nonce replay protection, pause/freeze controls |
 | `policy_registry_poc` | asset allowlist rules, recipient allowlist rules, transfer amount caps, policy version validation |
 | `intent_registry_poc` | scheduled intent storage, executor-gated execution marking, ledger-based execution windows, cancellation, child execution replay protection |
-| `recovery_guard_poc` | guardian records, delayed recovery requests, authenticated guardian approvals, threshold and ledger-based timelock checks |
+| `recovery_guard_poc` | guardian records, guardian removal, delayed recovery requests, authenticated guardian approvals, threshold and ledger-based timelock checks |
 
 ## PoC Boundary
 

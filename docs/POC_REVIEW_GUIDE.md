@@ -74,6 +74,7 @@ The PoC test suite verifies:
 - delayed recovery threshold and timelock checks
 - duplicate guardian approval rejection
 - duplicate guardian count handling
+- removed-guardian approval rejection and double-removal rejection
 
 ## Security Notes
 

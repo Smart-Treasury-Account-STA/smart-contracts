@@ -89,6 +89,18 @@ impl RecoveryGuardPoc {
         Ok(())
     }
 
+    pub fn remove_guardian(env: Env, guardian: Address) -> Result<(), RecoveryGuardError> {
+        ensure_admin(&env)?;
+        let key = DataKey::Guardian(guardian.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(RecoveryGuardError::GuardianNotFound);
+        }
+
+        env.storage().persistent().remove(&key);
+        env.events().publish((symbol_short!("unguard"),), guardian);
+        Ok(())
+    }
+
     pub fn open_recovery(
         env: Env,
         request_id: BytesN<32>,
@@ -346,6 +358,23 @@ mod tests {
         set_ledger(&env, 10);
         let below_threshold = client.try_finalize_recovery(&request_id);
         assert_eq!(below_threshold, Err(Ok(RecoveryGuardError::BelowThreshold)));
+    }
+
+    #[test]
+    fn removed_guardian_cannot_approve_and_double_removal_fails() {
+        let (env, client) = setup();
+        let request_id = id(&env, 5);
+        let guardian = Address::generate(&env);
+
+        client.add_guardian(&guardian);
+        client.remove_guardian(&guardian);
+
+        client.open_recovery(&request_id, &id(&env, 6), &10);
+        let revoked = client.try_approve_recovery(&request_id, &guardian);
+        assert_eq!(revoked, Err(Ok(RecoveryGuardError::GuardianNotFound)));
+
+        let double_removal = client.try_remove_guardian(&guardian);
+        assert_eq!(double_removal, Err(Ok(RecoveryGuardError::GuardianNotFound)));
     }
 
     #[test]

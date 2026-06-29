@@ -38,10 +38,10 @@ The SmartAccount contract is the root treasury authority. It is responsible for:
 - signer roles
 - signer weights
 - threshold validation
-- custom account authorization through `__check_auth`
+- custom account authorization through `__check_auth`, delegating passkey/WebAuthn signature verification to an integrated Soroban passkey toolkit rather than a custom-built verifier
 - policy version binding
 - replay protection
-- pause and freeze controls
+- pause and freeze controls, implemented via OpenZeppelin's audited Pausable module rather than a custom-built state machine
 - execution coordination with policy and adapter modules
 
 ## 3. PolicyEngine Contract

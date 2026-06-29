@@ -195,3 +195,4 @@ stellar contract invoke \
 - Contract instance and storage TTLs should be extended if the deployment must remain available for a long review period.
 - The PoC validates policy and execution state but does not perform real SAC transfers.
 - The production architecture adds full SmartAccount `__check_auth`, SAC execution adapters, dApp, SDK, relayer, deployment scripts, monitoring, and broader integration tests.
+- `recovery_guard_poc` gained a `remove_guardian` entrypoint after this deployment was recorded. The WASM hash and contract ID above reflect the source as it existed at deployment time; they no longer match the current source in this repository. Rebuild and redeploy before citing the RecoveryGuard PoC testnet artifacts as current.
