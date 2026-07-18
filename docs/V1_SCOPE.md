@@ -1,0 +1,141 @@
+# Smart Contract V1 Scope
+
+## Purpose
+
+This document describes the scope of the current onchain implementation and directly addresses the review notes raised on the earlier PoC revision:
+
+1. Integrate passkeys rather than building the wallet/auth layer from scratch — carried through the whole architecture, not just the auth flow.
+2. Justify the budget against what already exists as reusable Stellar/Soroban infrastructure, and state clearly what is genuinely new onchain.
+3. Stress-test signer-rule and approval logic under edge cases (signer set changes mid-flight, partial approvals) before treating this as production-ready.
+
+This revision replaces the earlier partial PoC preview. It is a working, cross-contract-integrated V1: seven Soroban packages, 105 passing unit/integration tests (98.6% line / 97.8% region / 90.9% function coverage workspace-wide — every package above 85% on every metric that isn't dominated by uninstrumentable macro-generated code, see [Verification](#verification)), real cryptographic and real Stellar Asset Contract fixtures where it matters. It has also been through two rounds of dedicated security review (see [§4](#4-security-review-findings-and-fixes) and [§5](#5-feature-verification-pass-additional-findings-and-fixes)) that together found and fixed seven real defects, one of them critical, plus closed a documented "Production requirement" gap that had no coverage at all. It is still not a mainnet-ready system — see [Not Yet Included](#not-yet-included-in-v1) below — but the boundary has moved substantially from the earlier PoC.
+
+## 1. Passkeys, fully carried through
+
+The earlier PoC's `smart_account_poc::validate_payment` accepted a caller-supplied list of "approver" IDs and counted stored weights against them **without ever calling `require_auth()` on the approvers** — explicitly flagged at the time as a gap deferred to "the production `__check_auth` implementation."
+
+That gap is now closed structurally, not patched. `contracts/smart_account` does not implement its own `__check_auth`, its own signer registry, or its own weight/threshold math. It composes three real, versioned, audited OpenZeppelin Stellar crates (`stellar-accounts`, `stellar-access`, `stellar-contract-utils`, all `0.7.2`, `soroban-sdk 26.1.0`):
+
+- **`stellar_accounts::smart_account`** supplies the `SmartAccount` trait (context rules, signer registry, policy attachment) and `do_check_auth`, which `contracts/smart_account`'s `CustomAccountInterface::__check_auth` delegates to directly. A registered signer is a `Signer::Delegated(Address)` (an ordinary Freighter/xBull wallet key) or `Signer::External(verifier_address, key_bytes)` — a passkey, where `verifier_address` points at `contracts/webauthn_verifier`.
+- **`contracts/webauthn_verifier`** is a ~90-line wrapper with zero custom cryptography: it dispatches to `stellar_accounts::verifiers::webauthn::verify` / `ed25519::verify` based on key length. Every check in the WebAuthn assertion procedure (challenge binding, user-presence/verification bits, backup-eligibility bits, the secp256r1 signature itself) is the crate's code, not ours. Its test suite (`cargo test -p sta-webauthn-verifier`) signs a real secp256r1 assertion with the `p256` crate and a real Ed25519 signature with `ed25519-dalek`, and verifies both through the deployed contract — not mocked.
+- **`stellar_accounts::policies::{weighted_threshold, spending_limit, simple_threshold}`** supply signer-weight/threshold-counting logic as attachable Policy contracts. `contracts/smart_account` never re-implements "how many signers is enough" — that math is either N-of-N (empty policy set) or delegated to one of these.
+- **`stellar_access::ownable`** and **`stellar_contract_utils::pausable`** supply owner gating and pause/unpause state, used as-is (see `#[contractimpl(contracttrait)] impl OzOwnable for SmartAccountTreasury {}`).
+
+Because every governance and payment entrypoint on `contracts/smart_account` funnels through the same `e.current_contract_address().require_auth()` call — `execute_transfer_payment`, `execute_split_payment`, `create_scheduled_payment`, and (via the `SmartAccount`/`Ownable`/`Pausable` trait defaults) every context-rule, signer, policy, and ownership management call — whether a given signer is a wallet key or a passkey is transparent to every piece of downstream treasury logic. This is what "carried through the architecture" means concretely: it is not a separate login step bolted onto an otherwise custom-built account. `stellar contract build` confirms this composition actually lands in the deployed interface — `stellar contract info interface --wasm target/wasm32v1-none/release/sta_smart_account.wasm` lists `add_context_rule`, `add_signer`, `add_policy`, `get_owner`, `transfer_ownership`, `pause`/`unpause`, and `__check_auth` alongside the treasury-specific entrypoints, all on one contract.
+
+## 2. What is genuinely new onchain
+
+With OpenZeppelin's crates covering signer authentication, threshold/weight math, admin gating, and pause state, the funded engineering work is exactly what is **not** covered by that layer:
+
+| Contract | What it adds beyond "wallet approvals + signer rules" |
+|---|---|
+| `contracts/policy_engine` | Treasury-directional risk controls independent of *who* signed: per-asset allowlist + amount cap, per-recipient allowlist, per-operation allow/block, all pinned to a version number so a later policy change cannot silently alter the semantics of an automation approved under an earlier version. Nothing in the OZ signer/policy stack knows what an "asset," "recipient," or "policy version" is — those concepts are all treasury-specific. |
+| `contracts/intent_registry` | A canonical, replay-safe state machine for scheduled/recurring execution: parent intent lifecycle, ledger-bound execution windows, per-child-execution replay protection, and now cumulative `execution_count` vs. `max_executions` bounding — closing a real gap where the PoC tracked per-child replay but not total usage. This is not something a generic passkey/multisig wallet contract provides. |
+| `contracts/recovery_manager` | Guardian quorum + ledger-delayed recovery **explicitly separated from day-to-day spend authority**, so recovering the account cannot double as a policy bypass. Approval accounting is **live-recomputed** from current guardian registration at finalize time (see [§3](#3-stress-testing-signer-rule-and-approval-logic)) rather than trusting a cached counter — a property a flat signer-threshold model does not have on its own. |
+| `contracts/transfer_adapter`, `contracts/split_adapter` | Narrow, exactly-preauthorized execution: each adapter calls `smart_account.require_auth()` on the *configured* treasury address before moving any SAC balance, so a relayer or compromised caller cannot swap the token, destination, or amount between wallet simulation and submission — doing so produces a different, unauthorized sub-invocation tree node. This is what stops "signer approval" from silently becoming "approval of anything." |
+
+Budget framing, stated plainly: the request does not fund building a passkey/smart-wallet product or a generic multisig — that layer is integrated from `stellar-accounts`/`stellar-access`/`stellar-contract-utils`. It funds the four contracts above: version-pinned treasury policy, replay-protected scheduled automation, spend/recovery separation, and exact-action adapter allowlisting. None of that exists as reusable Soroban infrastructure today; the signer/passkey/threshold layer it sits on top of already does, and V1 uses it directly rather than re-implementing it.
+
+## 3. Stress-testing signer-rule and approval logic
+
+The review note asked specifically about signer set changes mid-flight and partial approvals before this is treated as production-ready. Concretely tested (see file:test names for each):
+
+- **Guardian removed after approving, before finalize** (`recovery_manager::guardian_removed_after_approving_no_longer_counts_toward_threshold`) — a guardian approves while registered, is then removed, and the request can no longer finalize off the strength of that now-stale approval; `live_approval_count` recomputes from *current* guardian registration every time, not a cached counter. A fresh guardian's approval restores quorum.
+- **Threshold raised after approvals were cast** (`recovery_manager::raising_threshold_after_approvals_invalidates_a_previously_sufficient_request`) — a request that was sufficient under the threshold in effect when approvals were cast is not grandfathered in once the threshold changes; the check is always against the threshold in effect *at finalize time*.
+- **Finalized/cancelled request immutability** (`recovery_manager::finalized_request_rejects_further_approval_and_refinalization`) — no further approvals or re-finalization once a request has left the open state.
+- **Duplicate approver / duplicate guardian removal** (`recovery_manager`, and the original PoC's `smart_account`/`intent_registry` suites) — rejected explicitly rather than silently accepted or double-counted.
+- **Nonce replay across the whole interactive-payment path** (`smart_account::rejects_replayed_nonce`) and **cumulative execution-count replay** distinct from per-child replay (`intent_registry::cumulative_execution_limit_is_enforced_across_distinct_children`).
+- **Recovery pull ordering** (`smart_account::apply_recovery_before_finalization_is_rejected`, `apply_recovery_replaces_owner_and_lifts_freeze_exactly_once`) — recovery cannot be applied before `recovery_manager` reports it finalized, and applying a finalized request twice is rejected by its own replay guard.
+- **No authorization silently succeeds** (`smart_account::execute_transfer_payment_without_any_authorization_fails`, and the analogous test on both adapters) — `set_auths(&[])`, no mocking at all, proves the `require_auth()` gates are real rather than accidentally satisfied.
+- **Policy version bump between scheduling and execution** (`smart_account::policy_version_bump_after_intent_creation_blocks_execution`) — a scheduled payment's pinned policy version becomes stale the moment `policy_engine` moves on; execution fails closed with `VersionMismatch` rather than either silently re-approving under new rules or silently keeping the old ones alive.
+- **Freeze blocks scheduled execution too** (`smart_account::frozen_treasury_blocks_scheduled_execution`) — `execute_scheduled_payment` has no `require_auth()` of its own by design, so this specifically proves `ensure_active` still gates it.
+- **Cancellation actually stops execution end-to-end** (`smart_account::cancelled_scheduled_payment_cannot_execute_end_to_end`) — exercised through the full `smart_account` → `intent_registry` path, not just `intent_registry`'s own unit test.
+- **Split amount cap enforced per recipient, not in aggregate** (`smart_account::split_payment_fails_closed_when_one_recipient_amount_exceeds_the_cap`) — one over-cap recipient fails the whole batch even when every recipient is individually allow-listed and other amounts are fine.
+- **Nonce replay space is shared, not per-operation** (`smart_account::nonce_replay_protection_is_shared_across_transfer_and_split_operations`) — a nonce consumed by a transfer cannot be reused by a split.
+
+### Known, named residual risk (not silently left for a reviewer to find)
+
+- **OZ's own documented "Signer Set Divergence" risk** (`stellar_accounts::policies::weighted_threshold` module docs): if a `weighted_threshold` policy is attached to a context rule, the policy's stored per-signer weights are **not automatically updated** when signers are added to or removed from that rule. Removing a signer can push total available weight below the stored threshold (permanent DoS on that rule until an admin calls `set_signer_weight`/`set_threshold`); adding a signer without configuring its weight silently changes the effective approval ratio. This is an upstream, explicitly documented characteristic of the integrated crate, not something introduced here. Any STA deployment that attaches `weighted_threshold` to a context rule **must** follow the crate's own documented remediation steps (review `get_signer_weights`/`get_threshold` before removing signers; set weights before adding them) as an operational runbook item, not an onchain-enforced one in V1.
+- **Adapter address is resolved at execution time, not pinned at intent-creation time.** `execute_scheduled_payment` looks up the current `Adapter(operation)` mapping when it runs, not the mapping in effect when `create_scheduled_payment` was approved. Since `set_adapter` is owner-gated, this is not an external-attacker privilege escalation, but it does mean an owner (or a context rule's signers) can redirect a previously-approved scheduled payment to a different adapter before it executes. `docs/TECHNICAL_ARCHITECTURE.md` §6.9 already states the target invariant ("previously created automation capabilities remain pinned to the ... adapter IDs they were created under"); V1 does not yet implement that pinning. Tracked as a gap, not silently absent.
+
+## 4. Security review: findings and fixes
+
+A dedicated line-by-line security review of the full workspace (post-§1–3 implementation) found and fixed three real defects, and closed a documented "Production requirement" gap that had no coverage at all. Named here rather than left silent, per this repository's own convention:
+
+| Severity | Finding | Fix |
+|---|---|---|
+| **Critical** | `smart_account::execute_scheduled_payment` took `asset`, `destination`, `amount`, and `expected_policy_version` as **caller-supplied parameters** and used them directly for the policy check and adapter dispatch. The entrypoint has no `require_auth()` of its own by design (automation execution is meant to be permissionless once approved — see §1) — but `intent_registry`'s `Executor` role is explicitly the untrusted relayer (`docs/TECHNICAL_ARCHITECTURE.md` §13.1: "relayer MUST NOT hold owner, governance, recovery, or management authority"). Any caller able to satisfy the executor auth could redirect an already-approved scheduled payment to an arbitrary destination, asset, or amount, or pick a stale policy version to bypass version pinning. | `ScheduledIntent` (`intent_registry`) gained a `policy_version` field pinned at creation. `execute_scheduled_payment` now takes only `intent_id` and `child_sequence`; after `mark_child_executed` succeeds it fetches the canonical `ScheduledIntent` via `get_intent` and uses *its* `asset`/`destination`/`amount`/`policy_version` for the policy check and adapter call. `create_scheduled_payment` overwrites any caller-supplied `policy_version` with `policy_engine`'s actual current version at creation time — a caller cannot pin a stale or fabricated version either. See `smart_account::execute_scheduled_payment_only_ever_uses_the_canonical_intent_data`. |
+| **High** | `recovery_manager::open_recovery` accepted any `earliest_ledger`, including the current or a past ledger. The caller is `admin` — the same key recovery exists to route around if compromised — so the "delay gives the legitimate owner time to react" property was voluntary, not enforced. | Added `MIN_RECOVERY_DELAY_LEDGERS` (17280, ~1 day), enforced against the ledger sequence *at `open_recovery` time*, not an absolute value. See `open_recovery_rejects_delay_below_the_enforced_minimum`, `minimum_delay_is_relative_to_current_ledger_not_absolute`. |
+| **High** | Guardian registration had no delay. `admin` (the same potentially-compromised key) could call `add_guardian` for addresses it also controlled, then immediately reach threshold and finalize a self-serving recovery — the guardian-quorum requirement added no protection beyond the raw timelock. | Added `GUARDIAN_ACTIVATION_DELAY_LEDGERS` (17280, ~1 day): a guardian's approval does not count toward any threshold until this delay has passed since registration, checked both at `approve_recovery` time and in `live_approval_count`. Runs concurrently with the recovery timelock rather than sequenced after it — a deliberate scope/complexity tradeoff (total attack window stays ~1 day, not ~2), not an oversight. See `newly_added_guardian_cannot_approve_before_activation_delay`. |
+| **Production requirement, previously unaddressed** | `docs/TECHNICAL_ARCHITECTURE.md` §16 names TTL/storage-archival handling as a "Production requirement" with its own security-review-matrix row ("Test TTL extension paths ... before deployment"). Nothing in any contract extended TTL on any entry — every persistent key would eventually archive and become inaccessible. | Every contract now extends TTL (~30 days, matching the pattern OZ's own `stellar-accounts` crate uses) on every write to a critical entry, and on the hot-path reads that matter (`policy_engine::validate_policy`, `intent_registry::get_intent`, `recovery_manager::request_status`). Each of the five STA-authored contracts also gained a permissionless maintenance entrypoint (`extend_ttl` / `extend_intent_ttl`) for named, already-existing entries, matching §16.1's "extending TTL does not create authority" rule. `webauthn_verifier` needs none of this — it is fully stateless. OZ's own composed signer/context-rule storage inside `smart_account` manages its own TTL internally and was left untouched. See e.g. `writes_and_reads_extend_persistent_entry_ttl`, `guardian_and_request_ttl_is_extended_on_write_and_permissionless_maintenance`. |
+
+None of these were caught by the earlier reviewer notes or the original test suite — they surfaced from re-reading each contract's actual authorization and data-flow paths line by line against the architecture doc's stated invariants, matching the review areas §13.3's Security Review Matrix calls out.
+
+## 5. Feature verification pass: additional findings and fixes
+
+A follow-up pass cross-checked every module's actual code against the responsibilities and workflows `docs/SMART_CONTRACT_SPECIFICATION.md` and `docs/TECHNICAL_ARCHITECTURE.md` §12 (Key Workflows) describe for it, line by line rather than table by table. This found four more real gaps — three of them meaningful enough to fix, one substantial enough to defer and name explicitly rather than build under time pressure:
+
+| Finding | Fix |
+|---|---|
+| `intent_registry::cancel_intent` existed and was correctly `ensure_admin`-gated, but `intent_registry`'s configured admin is `smart_account`'s own contract address — and `smart_account` never exposed any entrypoint that could invoke it. There was no way for anyone, including the treasury's own signers, to ever cancel a scheduled payment. | Added `smart_account::cancel_scheduled_payment(intent_id)`, requiring this contract's own authorization (same model as `create_scheduled_payment`), which calls `intent_registry.cancel_intent`. See `cancelled_scheduled_payment_cannot_execute_end_to_end`. |
+| `recovery_manager::open_recovery` required the **admin's own** authorization to open a request. `docs/TECHNICAL_ARCHITECTURE.md` §12.7's canonical recovery workflow explicitly has a **guardian** trigger the process ("Guardian or recovery quorum triggers freeze," "Recovery plan is initiated" by the same actor) — but as implemented, recovery was unusable in exactly the scenario it exists for: the owner's key is lost or destroyed, not merely held by someone who might misuse it. A guardian had no way to start recovery unassisted. | `open_recovery` now accepts an explicit `caller` and permits either the admin *or* any currently-**active** guardian (same activation-delay gate `approve_recovery` already uses, closing the same sybil path for opening as for approving). The threshold and timelock — not who was allowed to open the request — are what actually gate the outcome. See `active_guardian_can_open_recovery_without_admin`, `not_yet_active_guardian_cannot_open_recovery`, `unrelated_third_party_cannot_open_recovery`. |
+| Same §12.7 workflow's first step — "Guardian ... triggers freeze" — had no implementation at all: `smart_account::freeze()` was (and remains) owner-gated only, with no guardian-facing path. If the owner was the compromised party, guardians could open a slow (timelocked) recovery, but could not stop ongoing spend authority in the meantime. | Added `recovery_manager::request_guardian_freeze` (any single **active** guardian, no threshold — freezing is conservative and reversible only via recovery, so it doesn't need the same bar as *replacing* authority) and `recovery_manager::guardian_freeze_requested` (view). `smart_account::apply_guardian_freeze` pulls this the same way `apply_recovery` pulls a finalized request: permissionlessly, on this contract's own terms, with `recovery_manager` carrying no knowledge of or dependency on the treasury that pulls it. See `guardian_can_independently_freeze_the_treasury`. |
+| `docs/TECHNICAL_ARCHITECTURE.md` §12.6 documents SmartAccount as validating "duplicate destinations" for a split action. `execute_split_payment` never checked this — a repeated recipient wasn't exploitable (the total moved still equalled the declared sum, to an already-approved recipient) but silently produced two transfers instead of one, which the architecture explicitly calls for rejecting instead. | `execute_split_payment` now rejects any split whose recipient list contains a duplicate address before any policy check or transfer runs. See `split_payment_rejects_duplicate_recipient`. |
+
+**Deferred, named explicitly rather than built under time pressure:** `docs/TECHNICAL_ARCHITECTURE.md` §12.3 documents a full **Scoped Session Key** workflow — admin creates a session key record with a bounded scope (allowed action/asset/destination/adapter, per-execution and cumulative amount caps, expiry, single-use auto-revoke) — and §11.2's `SessionScope` state model backs it. **None of this exists in V1.** It is a substantial, independent feature (bounded delegated signing with its own cumulative-accounting state), not a small gap like the four above, and building it under this pass would have meant doing it without the same level of scrutiny the rest of V1 got. Added to "Not Yet Included in V1" below rather than implemented hastily.
+
+## Included in V1
+
+Four treasury contracts plus a shared verifier, all in `contracts/`:
+
+| Package | Purpose |
+|---|---|
+| `webauthn_verifier` | Stateless WebAuthn/secp256r1 + Ed25519 verifier wrapper around `stellar-accounts`, deployed once, referenced by any number of signer records. |
+| `smart_account` | Treasury root: composes OZ `SmartAccount`/`CustomAccountInterface`/`Ownable`/`Pausable`; interactive and scheduled payment execution (create/execute/cancel); one-way emergency freeze, plus a guardian-pulled freeze path; recovery pull. |
+| `policy_engine` | Asset/recipient/operation allowlists, amount caps, version pinning. |
+| `intent_registry` | Scheduled intent lifecycle, ledger-bound execution windows, per-child replay protection, cumulative execution-count bounding, cancellation. |
+| `recovery_manager` | Guardian registration/removal, guardian- or admin-initiated recovery requests, guardian-initiated emergency freeze requests, authenticated approval, live-recomputed threshold + ledger-based timelock, permissionless finalization. |
+| `transfer_adapter` | Single-recipient SAC transfer, narrowly preauthorized. |
+| `split_adapter` | Bounded one-to-many SAC split, narrowly preauthorized, each recipient independently policy-checked, duplicate recipients rejected. |
+
+## Not Yet Included in V1
+
+- **Scoped session keys** (`docs/TECHNICAL_ARCHITECTURE.md` §12.3, §11.2) — bounded delegated signing with per-execution/cumulative amount caps, asset/destination/adapter scoping, expiry, and single-use auto-revoke. A substantial, independent feature with its own cumulative-accounting state; not present in V1 at all. Named explicitly in [§5](#5-feature-verification-pass-additional-findings-and-fixes) rather than built hastily.
+- `ConditionVerifier` (optional proof-gated execution extension) — explicitly deferred; the architecture docs mark it optional, and it was not part of the reviewed concerns.
+- TypeScript SDK, production dApp, relayer implementation, monitoring/indexer services. (Testnet deployment automation *is* included — `scripts/deploy_testnet.sh` — but everything it can drive is bounded by plain owner/admin authorization; see `docs/TESTNET_DEPLOYMENT.md` §7 for exactly why signer-gated payment calls need the SDK/dApp layer above, not the CLI.)
+- Delayed-governance replacement of pinned subordinate module addresses (`policy_engine`/`intent_registry`/`recovery_manager` are pinned at `smart_account::initialize` and immutable thereafter in V1, matching the documented V1 default rule in §6.9).
+- Adapter-pinning at intent-creation time (see residual risk above).
+- Extended `PolicyEngine` scope: per-destination rolling windows, daily outflow caps, operation-specific escalation — `TECHNICAL_ARCHITECTURE.md` §3 marks these "Extended policy scope," beyond V1.
+- Recovery cancellation (`recovery_manager::cancel_recovery`) remains admin-only, unlike opening a request or requesting a freeze — this is deliberate, not an oversight: it is the legitimate owner's safety valve against guardian collusion, symmetric to guardians being the safety valve against a compromised owner. Making it guardian-accessible too would remove that check entirely.
+
+## Verification
+
+```bash
+cargo test --workspace
+```
+
+Expected: 105 tests pass across 7 packages, zero failures. This includes real cryptographic fixtures (`webauthn_verifier`) and real Stellar Asset Contract transfers (`transfer_adapter`, `split_adapter`, and the full `smart_account` integration suite, which wires real instances of every subordinate contract rather than mocking them).
+
+```bash
+cargo llvm-cov --workspace --summary-only
+```
+
+Expected: workspace totals of 98.6% line / 97.8% region / 90.9% function coverage — all three above 90%. Per package (lines / regions / functions):
+
+| Package | Lines | Regions | Functions |
+|---|---|---|---|
+| `intent_registry` | 99.45% | 97.78% | 94.59% |
+| `policy_engine` | 99.08% | 98.00% | 91.43% |
+| `recovery_manager` | 99.69% | 98.29% | 96.55% |
+| `smart_account` | 93.44% | 91.68% | 80.00% |
+| `split_adapter` | 98.44% | 96.94% | 80.00% |
+| `transfer_adapter` | 97.92% | 95.52% | 80.00% |
+| `webauthn_verifier` | 86.84% | 86.49% | 54.55% |
+
+Every package clears 85% on lines and regions. Four packages' function-level percentages sit below 90% — verified via raw `lcov` symbol inspection (mangled names, not guesswork) to be entirely accounted for by `#[contractimpl]`/derive-macro-generated dispatch shims: `TryFrom<ScVal>` conversion impls for each `#[contracttype]` (only exercised when a contract is invoked through genuine WASM/XDR marshalling, never through the native `Env::register` + generated-Client pattern every test in this workspace uses, including OZ's own ~2000-line `stellar-accounts` test suite for this exact account/context-rule system), and — for `smart_account` specifically — the raw `__check_auth` WASM export (its one-line body, `do_check_auth(...)`, is only invoked by the host's real authorization-entry mechanism, which `mock_all_auths()` deliberately bypasses; see the module docs on why this is the established testing boundary throughout this workspace, not an oversight). These are not reachable by writing more unit tests, at any effort level, within this test harness. The line/region numbers above reflect real application logic and are what to trust for this metric.
+
+```bash
+stellar contract build --optimize --out-dir wasm
+```
+
+Produces deployable WASM for all seven packages. All seven are deployed and wired live on Stellar testnet (`./scripts/deploy_testnet.sh`) — see `docs/TESTNET_DEPLOYMENT.md` for the real contract addresses, transactions, and one explicitly named limitation on which entrypoints a bare CLI deployment can drive (signer-gated payment calls need the off-chain wallet/SDK layer named below, not just the CLI).

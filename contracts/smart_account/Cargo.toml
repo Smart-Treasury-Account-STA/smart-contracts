@@ -1,0 +1,23 @@
+[package]
+name = "sta-smart-account"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+stellar-accounts = { workspace = true }
+stellar-access = { workspace = true }
+stellar-contract-utils = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+sta-policy-engine = { path = "../policy_engine" }
+sta-intent-registry = { path = "../intent_registry" }
+sta-recovery-manager = { path = "../recovery_manager" }
+sta-transfer-adapter = { path = "../transfer_adapter" }
+sta-split-adapter = { path = "../split_adapter" }
+

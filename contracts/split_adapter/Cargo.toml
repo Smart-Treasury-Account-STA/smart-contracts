@@ -1,5 +1,5 @@
 [package]
-name = "sta-policy-registry-poc"
+name = "sta-split-adapter"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

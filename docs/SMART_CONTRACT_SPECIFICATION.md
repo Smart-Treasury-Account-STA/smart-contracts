@@ -14,20 +14,22 @@ The target STA contract system is composed of several Soroban modules:
 | ConditionVerifier | Optional extension for proof-gated execution using signed external attestations |
 | TypeScript SDK | Typed helpers for contract calls, transaction preparation, event parsing, and network configuration |
 
-### 1.1 Repository PoC Mapping
+### 1.1 Repository V1 Mapping
 
-The repository includes a focused PoC implementation of selected contract responsibilities. The PoC is intentionally partial and does not replace the full production specification in this document.
+The repository includes a working V1 implementation of the contract responsibilities below, superseding the earlier partial PoC. `docs/V1_SCOPE.md` is the authoritative statement of what's implemented, what's integrated from OpenZeppelin's Stellar contracts rather than built, and what remains deferred.
 
-| Full module | PoC package | Scope represented in the PoC |
+| Full module | V1 package | Scope represented in V1 |
 |---|---|---|
-| SmartAccount | `contracts/smart_account_poc` | signer records, weights, thresholds, payment validation, nonce replay protection, pause/freeze state |
-| PolicyEngine | `contracts/policy_registry_poc` | asset rules, recipient rules, amount caps, policy version checks |
-| IntentRegistry | `contracts/intent_registry_poc` | scheduled intent records, executor-gated execution marking, ledger-based execution windows, child execution replay protection |
-| RecoveryManager | `contracts/recovery_guard_poc` | guardian records, guardian removal, authenticated guardian approvals, delayed recovery requests, approval counting, ledger-based finalization checks |
+| SmartAccount | `contracts/smart_account` | Composes OZ `SmartAccount`/`CustomAccountInterface`/`Ownable`/`Pausable` (context rules, signer registry, `__check_auth`, owner gating, pause state — not custom-built); adds nonce-replay-protected interactive payments, scheduled payment creation/execution, one-way emergency freeze, recovery pull |
+| PolicyEngine | `contracts/policy_engine` | asset rules, recipient rules, operation allow/block, amount caps, policy version checks |
+| IntentRegistry | `contracts/intent_registry` | scheduled intent records, executor-gated execution marking, ledger-based execution windows, per-child execution replay protection, cumulative execution-count bounding |
+| RecoveryManager | `contracts/recovery_manager` | guardian records, guardian removal, authenticated guardian approvals live-recomputed against current guardian registration at finalize time, delayed recovery requests, ledger-based finalization checks |
+| Passkey/WebAuthn verifier | `contracts/webauthn_verifier` | stateless wrapper dispatching to OZ's `verifiers::webauthn`/`verifiers::ed25519` — zero custom cryptography |
+| Payment execution module | `contracts/transfer_adapter`, `contracts/split_adapter` | real SAC transfer/split execution, narrowly preauthorized via `smart_account.require_auth()` on the exact call |
 
-The remaining production modules, including real SAC transfer execution, adapter dispatch, full `__check_auth`, SDK, relayer, dApp, deployment scripts, and monitoring, are specified as part of the complete STA architecture.
+The remaining production modules — full `ConditionVerifier`, TypeScript SDK, relayer, dApp, monitoring, and delayed-governance replacement of pinned module addresses — are specified as part of the complete STA architecture and remain out of scope for this repository; see `docs/V1_SCOPE.md`'s "Not Yet Included in V1" section.
 
-The current PoC packages are deployed on Stellar testnet. Contract IDs, deployment transactions, and example interactions are recorded in `TESTNET_DEPLOYMENT.md`.
+The current V1 packages are deployed live on Stellar testnet — see `docs/TESTNET_DEPLOYMENT.md`. The prior PoC's separate deployment record is archived in `docs/archive/POC_TESTNET_DEPLOYMENT.md`.
 
 ## 2. SmartAccount Contract
 
@@ -38,10 +40,10 @@ The SmartAccount contract is the root treasury authority. It is responsible for:
 - signer roles
 - signer weights
 - threshold validation
-- custom account authorization through `__check_auth`, delegating passkey/WebAuthn signature verification to an integrated Soroban passkey toolkit rather than a custom-built verifier
+- custom account authorization through `__check_auth`, delegating entirely to `stellar_accounts::smart_account::do_check_auth` (context rules, signer registry, policy attachment) rather than a custom-built verifier or threshold engine — implemented in `contracts/smart_account`, verified in `docs/V1_SCOPE.md` §1
 - policy version binding
 - replay protection
-- pause and freeze controls, implemented via OpenZeppelin's audited Pausable module rather than a custom-built state machine
+- pause and freeze controls: pause via OpenZeppelin's audited `stellar_contract_utils::pausable` module, freeze as a custom one-way flag lifted only through `RecoveryManager`
 - execution coordination with policy and adapter modules
 
 ## 3. PolicyEngine Contract

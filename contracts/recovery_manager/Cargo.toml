@@ -1,5 +1,5 @@
 [package]
-name = "sta-recovery-guard-poc"
+name = "sta-recovery-manager"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -10,6 +10,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        # `-A deprecated` covers a known, pre-existing migration: several
+        # event-emission call sites use soroban-sdk's older `Events::publish`
+        # API instead of the newer `#[contractevent]` macro. Tracked as a
+        # follow-up, not silenced blindly — every other warning still fails
+        # the build.
+        run: cargo clippy --workspace --all-targets -- -D warnings -A deprecated
       - name: cargo test
         run: cargo test --workspace
+      - name: install stellar CLI
+        # Plain `cargo build --target wasm32v1-none` doesn't work here: the
+        # workspace opts into soroban-sdk's `experimental_spec_shaking_v2`
+        # feature, which is only supported through `stellar contract build`
+        # (stellar-cli 25.2.0+) — the same tool `scripts/deploy_testnet.sh`
+        # uses, so this step exercises the real build path, not a proxy for it.
+        run: cargo install --locked stellar-cli --version 26.0.0
+      - name: stellar contract build
+        run: stellar contract build --optimize --out-dir wasm

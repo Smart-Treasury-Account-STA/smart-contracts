@@ -1,9 +1,12 @@
 [workspace]
 members = [
-    "contracts/smart_account_poc",
-    "contracts/policy_registry_poc",
-    "contracts/intent_registry_poc",
-    "contracts/recovery_guard_poc",
+    "contracts/webauthn_verifier",
+    "contracts/smart_account",
+    "contracts/policy_engine",
+    "contracts/intent_registry",
+    "contracts/recovery_manager",
+    "contracts/transfer_adapter",
+    "contracts/split_adapter",
 ]
 resolver = "2"
 
@@ -13,7 +16,10 @@ license = "Apache-2.0"
 version = "0.1.0"
 
 [workspace.dependencies]
-soroban-sdk = { version = "22.0.1", features = [] }
+soroban-sdk = { version = "26.1.0", features = ["experimental_spec_shaking_v2"] }
+stellar-accounts = "0.7.2"
+stellar-access = "0.7.2"
+stellar-contract-utils = "0.7.2"
 
 [profile.release]
 opt-level = "z"

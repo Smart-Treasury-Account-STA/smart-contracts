@@ -1,32 +1,57 @@
 # Contract Workspace
 
-This directory contains the focused Soroban PoC implementation for Smart Treasury Account.
+This directory contains the V1 Soroban implementation for Smart Treasury Account.
 
-The full technical design is documented in `../docs/TECHNICAL_ARCHITECTURE.md` and `../docs/SMART_CONTRACT_SPECIFICATION.md`. The code here is intentionally smaller than the final system, but it is organized around the same core contract responsibilities.
+The full technical design is documented in `../docs/TECHNICAL_ARCHITECTURE.md` and `../docs/SMART_CONTRACT_SPECIFICATION.md`. `../docs/V1_SCOPE.md` covers exactly what's implemented here versus integrated from OpenZeppelin's Stellar contracts versus still deferred.
 
-## Included PoC Contracts
+## Contracts
 
-| Contract package | What it demonstrates |
+| Contract package | What it does |
 |---|---|
-| `smart_account_poc` | treasury account initialization, signer records, signer weights, approval thresholds, policy version binding, nonce replay protection, pause/freeze controls |
-| `policy_registry_poc` | asset allowlist rules, recipient allowlist rules, transfer amount caps, policy version validation |
-| `intent_registry_poc` | scheduled intent storage, executor-gated execution marking, ledger-based execution windows, cancellation, child execution replay protection |
-| `recovery_guard_poc` | guardian records, guardian removal, delayed recovery requests, authenticated guardian approvals, threshold and ledger-based timelock checks |
+| `webauthn_verifier` | Stateless WebAuthn/secp256r1 + Ed25519 verification, wrapping `stellar-accounts` with zero custom cryptography. Deployed once, referenced by any number of `smart_account` signer records. |
+| `smart_account` | Treasury root. Composes OpenZeppelin's `SmartAccount` (context rules, signer registry, `__check_auth`), `Ownable`, and `Pausable` — no custom auth or threshold code. Adds treasury-specific logic: nonce-replay-protected interactive payments, scheduled payment creation/execution/cancellation, one-way emergency freeze (owner- or guardian-triggered via `apply_guardian_freeze`), and recovery pull. |
+| `policy_engine` | Asset allowlist rules, recipient allowlist rules, per-operation allow/block, transfer amount caps, policy version validation. |
+| `intent_registry` | Scheduled intent storage, executor-gated execution marking, ledger-based execution windows, cancellation, per-child replay protection, cumulative execution-count bounding. |
+| `recovery_manager` | Guardian records, guardian removal, authenticated guardian approvals (live-recomputed against current guardian registration at finalize time — not a cached counter), threshold and ledger-based timelock checks, permissionless finalization, guardian-initiated `open_recovery` (no admin required) and guardian-initiated emergency freeze request. |
+| `transfer_adapter` | Single-recipient SAC transfer. Requires the configured `smart_account`'s authorization for the exact call before moving any balance. |
+| `split_adapter` | Bounded one-to-many SAC split. Same preauthorization requirement as `transfer_adapter`. |
 
-## PoC Boundary
+## What's Integrated, Not Built
 
-The PoC does not execute real SAC transfers, implement production `__check_auth`, or include the dApp, SDK, relayer, deployment scripts, or monitoring stack. Those are specified in the architecture documents.
+`smart_account` depends directly on three OpenZeppelin Stellar crates (`stellar-accounts`, `stellar-access`, `stellar-contract-utils`, all `0.7.2`): signer registry and context-rule authorization, WebAuthn/Ed25519 signature verification, weighted/simple-threshold signer math, ownership management, and pause state are all theirs, composed via trait defaults (`#[contractimpl(contracttrait)] impl ... for SmartAccountTreasury {}`), not reimplemented. See `../docs/V1_SCOPE.md` §1 for how this is verified to actually land in the deployed contract interface, not just the source.
 
-The purpose of this workspace is to show concrete Soroban implementation direction for the highest-risk onchain patterns: authorization state, policy checks, replay protection, scheduled execution state, real ledger-bound timing checks, and recovery controls.
+## V1 Boundary
+
+Not yet included: `ConditionVerifier` (optional proof-gated execution extension), the dApp, SDK, relayer, monitoring stack, or delayed-governance replacement of pinned subordinate module addresses. `../docs/V1_SCOPE.md` names these explicitly, plus two specific known residual risks (an OZ-documented signer-weight divergence caveat, and adapter resolution happening at execution time rather than pinned at intent-creation time). Deployment scripts themselves *are* included — see below.
+
+The purpose of this workspace is concrete, tested Soroban implementation of the highest-risk onchain patterns: passkey/wallet signer authorization (integrated), treasury policy checks, replay protection across three distinct dimensions, real ledger-bound timing checks, spend/recovery separation, and narrow preauthorized execution. Two rounds of dedicated security review (`../docs/V1_SCOPE.md` §4 and §5) found and fixed seven real defects — one critical (scheduled-payment execution trusted caller-supplied data instead of the canonical approved intent) — plus closed a previously-unaddressed TTL/storage-archival gap, a scheduled payment that could never be cancelled, guardian-initiated recovery/freeze that didn't exist despite being documented, and unrejected duplicate split recipients.
 
 ## Verification
 
 Run from the repository root:
 
 ```bash
-cargo test
+cargo test --workspace
+```
+
+105 tests across all 7 packages. Measure coverage with:
+
+```bash
+cargo llvm-cov --workspace --summary-only
+```
+
+98.6% line / 97.8% region / 90.9% function coverage workspace-wide; every package clears 85% on lines and regions. Build deployable WASM with:
+
+```bash
+stellar contract build --optimize --out-dir wasm
 ```
 
 ## Testnet Deployment
 
-The current PoC contracts have been deployed to Stellar testnet. Contract IDs, WASM hashes, deployment transactions, and demonstration transactions are recorded in `../docs/TESTNET_DEPLOYMENT.md`.
+All 7 packages are deployed and wired on Stellar testnet as of 2026-07-18 — real contract addresses, transactions, and an initialized `smart_account` with a founding Ed25519 wallet signer. Reproduce with:
+
+```bash
+../scripts/deploy_testnet.sh
+```
+
+See `../docs/TESTNET_DEPLOYMENT.md` for the full contract-address/transaction record. That document also names one specific, deliberate limitation: entrypoints gated by the treasury's own signer authorization (`execute_transfer_payment`, `execute_split_payment`, `create_scheduled_payment`, `ExecutionEntryPoint::execute`) can't be driven by the bare `stellar` CLI, since satisfying them requires constructing OpenZeppelin's `AuthPayload` off-chain — exactly the wallet/SDK/relayer layer this repository doesn't include. Everything gated by plain owner/admin authorization (initialization, `set_adapter`, `add_guardian`, all `policy_engine` configuration) is deployed, wired, and demonstrated live, including a real on-chain rejection of an unapproved recipient and an over-cap amount. The prior PoC deployment record (different contract names, `soroban-sdk 22.0.1`, no OZ composition) is archived separately in `../docs/archive/POC_TESTNET_DEPLOYMENT.md` — not part of the current implementation.
