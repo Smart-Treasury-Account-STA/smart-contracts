@@ -16,12 +16,7 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       - name: cargo clippy
-        # `-A deprecated` covers a known, pre-existing migration: several
-        # event-emission call sites use soroban-sdk's older `Events::publish`
-        # API instead of the newer `#[contractevent]` macro. Tracked as a
-        # follow-up, not silenced blindly — every other warning still fails
-        # the build.
-        run: cargo clippy --workspace --all-targets -- -D warnings -A deprecated
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test
         run: cargo test --workspace
       - name: install stellar CLI

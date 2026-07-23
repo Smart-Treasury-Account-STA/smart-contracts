@@ -15,7 +15,8 @@
 //! math.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address, Env,
+    Symbol, Vec,
 };
 
 const INITIAL_VERSION: u32 = 1;
@@ -45,6 +46,47 @@ pub struct AssetRule {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyCheck {
+    pub operation: Symbol,
+    pub asset: Address,
+    pub destination: Address,
+    pub amount: i128,
+    pub expected_version: u32,
+}
+
+#[contractevent(topics = ["init"])]
+pub struct Initialized {
+    #[topic]
+    pub admin: Address,
+}
+
+#[contractevent(topics = ["asset"])]
+pub struct AssetRuleUpdated {
+    #[topic]
+    pub asset: Address,
+}
+
+#[contractevent(topics = ["rcpt"])]
+pub struct RecipientAllowedUpdated {
+    #[topic]
+    pub recipient: Address,
+    pub allowed: bool,
+}
+
+#[contractevent(topics = ["op"])]
+pub struct OperationAllowedUpdated {
+    #[topic]
+    pub operation: Symbol,
+    pub allowed: bool,
+}
+
+#[contractevent(topics = ["policy"])]
+pub struct PolicyVersionBumped {
+    pub next_version: u32,
+}
+
+#[contractevent(topics = ["pol_ok"])]
+pub struct PolicyValidated {
+    #[topic]
     pub operation: Symbol,
     pub asset: Address,
     pub destination: Address,
@@ -98,7 +140,10 @@ impl PolicyEngine {
         bump_ttl(&env, &DataKey::Initialized);
         bump_ttl(&env, &DataKey::Admin);
         bump_ttl(&env, &DataKey::Version);
-        env.events().publish((symbol_short!("init"),), admin);
+        Initialized {
+            admin: admin.clone(),
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -145,7 +190,10 @@ impl PolicyEngine {
         let key = DataKey::Asset(asset.clone());
         env.storage().persistent().set(&key, &rule);
         bump_ttl(&env, &key);
-        env.events().publish((symbol_short!("asset"),), asset);
+        AssetRuleUpdated {
+            asset: asset.clone(),
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -158,8 +206,11 @@ impl PolicyEngine {
         let key = DataKey::Recipient(recipient.clone());
         env.storage().persistent().set(&key, &allowed);
         bump_ttl(&env, &key);
-        env.events()
-            .publish((symbol_short!("rcpt"),), (recipient, allowed));
+        RecipientAllowedUpdated {
+            recipient: recipient.clone(),
+            allowed,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -175,8 +226,11 @@ impl PolicyEngine {
         let key = DataKey::Operation(operation.clone());
         env.storage().persistent().set(&key, &allowed);
         bump_ttl(&env, &key);
-        env.events()
-            .publish((symbol_short!("op"),), (operation, allowed));
+        OperationAllowedUpdated {
+            operation: operation.clone(),
+            allowed,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -190,8 +244,7 @@ impl PolicyEngine {
             .persistent()
             .set(&DataKey::Version, &next_version);
         bump_ttl(&env, &DataKey::Version);
-        env.events()
-            .publish((symbol_short!("policy"),), next_version);
+        PolicyVersionBumped { next_version }.publish(&env);
         Ok(())
     }
 
@@ -240,16 +293,14 @@ impl PolicyEngine {
         }
         bump_ttl(&env, &recipient_key);
 
-        env.events().publish(
-            (symbol_short!("pol_ok"),),
-            (
-                check.operation,
-                check.asset,
-                check.destination,
-                check.amount,
-                check.expected_version,
-            ),
-        );
+        PolicyValidated {
+            operation: check.operation,
+            asset: check.asset,
+            destination: check.destination,
+            amount: check.amount,
+            expected_version: check.expected_version,
+        }
+        .publish(&env);
         Ok(())
     }
 }

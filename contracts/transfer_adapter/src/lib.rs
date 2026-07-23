@@ -18,8 +18,8 @@
 //! authorization.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, symbol_short, token::TokenClient, Address, Env,
-    MuxedAddress, Symbol,
+    contract, contracterror, contractevent, contractimpl, symbol_short, token::TokenClient,
+    Address, Env, MuxedAddress, Symbol,
 };
 
 /// See `docs/TECHNICAL_ARCHITECTURE.md` §16 ("Production requirement").
@@ -39,6 +39,21 @@ pub enum TransferAdapterError {
     AlreadyInitialized = 6000,
     NotInitialized = 6001,
     InvalidAmount = 6002,
+}
+
+#[contractevent(topics = ["init"])]
+pub struct Initialized {
+    #[topic]
+    pub smart_account: Address,
+}
+
+#[contractevent(topics = ["xfer"])]
+pub struct TransferExecuted {
+    #[topic]
+    pub token: Address,
+    #[topic]
+    pub to: Address,
+    pub amount: i128,
 }
 
 #[contractimpl]
@@ -66,8 +81,7 @@ impl TransferAdapter {
         env.storage()
             .instance()
             .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
-        env.events()
-            .publish((symbol_short!("init"),), smart_account);
+        Initialized { smart_account }.publish(&env);
         Ok(())
     }
 
@@ -91,8 +105,7 @@ impl TransferAdapter {
         let to_muxed: MuxedAddress = to.clone().into();
         token_client.transfer(&smart_account, &to_muxed, &amount);
 
-        env.events()
-            .publish((symbol_short!("xfer"),), (token, to, amount));
+        TransferExecuted { token, to, amount }.publish(&env);
         Ok(())
     }
 }

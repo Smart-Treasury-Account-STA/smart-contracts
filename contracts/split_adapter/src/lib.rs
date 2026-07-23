@@ -9,8 +9,8 @@
 //! recipient after the signer approved the split.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, symbol_short, token::TokenClient, Address, Env,
-    MuxedAddress, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, symbol_short, token::TokenClient,
+    Address, Env, MuxedAddress, Symbol, Vec,
 };
 
 const MAX_RECIPIENTS: u32 = 20;
@@ -35,6 +35,20 @@ pub enum SplitAdapterError {
     TotalAmountOverflow = 7006,
 }
 
+#[contractevent(topics = ["init"])]
+pub struct Initialized {
+    #[topic]
+    pub smart_account: Address,
+}
+
+#[contractevent(topics = ["split"])]
+pub struct SplitExecuted {
+    #[topic]
+    pub token: Address,
+    pub recipient_count: u32,
+    pub total: i128,
+}
+
 #[contractimpl]
 impl SplitAdapter {
     pub fn contract_name() -> Symbol {
@@ -56,8 +70,7 @@ impl SplitAdapter {
         env.storage()
             .instance()
             .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
-        env.events()
-            .publish((symbol_short!("init"),), smart_account);
+        Initialized { smart_account }.publish(&env);
         Ok(())
     }
 
@@ -102,8 +115,12 @@ impl SplitAdapter {
             token_client.transfer(&smart_account, &to_muxed, &amount);
         }
 
-        env.events()
-            .publish((symbol_short!("split"),), (token, recipients.len(), total));
+        SplitExecuted {
+            token,
+            recipient_count: recipients.len(),
+            total,
+        }
+        .publish(&env);
         Ok(())
     }
 }

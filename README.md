@@ -75,7 +75,7 @@ Start at **`docs/README.md`** — it's the reviewer-facing index with a recommen
 cargo test --workspace
 ```
 
-105 tests across 7 packages (98.6% line / 97.8% region / 90.9% function coverage workspace-wide, `cargo llvm-cov --workspace`), including real cryptographic fixtures and real Stellar Asset Contract transfers. Has been through two rounds of dedicated security review — see `docs/V1_SCOPE.md` §4 and §5 for the findings and fixes.
+118 tests across 7 packages (98.7% line / 97.9% region / 91.1% function coverage workspace-wide, `cargo llvm-cov --workspace`), including real cryptographic fixtures and real Stellar Asset Contract transfers. Has been through three rounds of security review — see `docs/V1_SCOPE.md` §4, §5, and §6 for the findings and fixes, all of which are now fixed.
 
 ## Build Deployable WASM
 

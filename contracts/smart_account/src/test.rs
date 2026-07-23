@@ -110,8 +110,19 @@ fn setup() -> Harness {
         &intent_registry_id,
         &recovery_manager_id,
     );
-    smart_account.set_adapter(&Symbol::new(&env, "transfer"), &transfer_adapter_id);
-    smart_account.set_adapter(&Symbol::new(&env, "split"), &split_adapter_id);
+    // Adapter changes are timelocked (independent security review finding;
+    // see `docs/SMART_CONTRACT_AUDIT_REPORT.md`): propose, advance past the
+    // delay, apply, then restore the ledger to its starting point so this
+    // setup step doesn't leak into every test's own ledger expectations.
+    let starting_ledger = env.ledger().sequence();
+    smart_account.propose_adapter_change(&Symbol::new(&env, "transfer"), &transfer_adapter_id);
+    smart_account.propose_adapter_change(&Symbol::new(&env, "split"), &split_adapter_id);
+    env.ledger()
+        .with_mut(|l| l.sequence_number = starting_ledger + 17280);
+    smart_account.apply_adapter_change(&Symbol::new(&env, "transfer"));
+    smart_account.apply_adapter_change(&Symbol::new(&env, "split"));
+    env.ledger()
+        .with_mut(|l| l.sequence_number = starting_ledger);
 
     let token = env
         .register_stellar_asset_contract_v2(owner.clone())
@@ -281,6 +292,9 @@ fn scheduled_payment_creation_and_relayer_triggered_execution() {
             // Overwritten by `create_scheduled_payment` with policy_engine's
             // actual current version regardless of what's supplied here.
             policy_version: 999,
+            // Overwritten by `create_scheduled_payment` with the currently
+            // configured transfer_adapter regardless of what's supplied here.
+            adapter: addr(&h.env),
             cancelled: false,
         });
     assert_eq!(h.intent_registry.get_intent(&intent_id).policy_version, 1);
@@ -333,6 +347,7 @@ fn execute_scheduled_payment_only_ever_uses_the_canonical_intent_data() {
             max_executions: 1,
             execution_count: 0,
             policy_version: 0,
+            adapter: addr(&h.env),
             cancelled: false,
         });
 
@@ -595,6 +610,7 @@ fn policy_version_bump_after_intent_creation_blocks_execution() {
             max_executions: 1,
             execution_count: 0,
             policy_version: 0,
+            adapter: addr(&h.env),
             cancelled: false,
         });
     assert_eq!(h.intent_registry.get_intent(&intent_id).policy_version, 1);
@@ -630,6 +646,7 @@ fn frozen_treasury_blocks_scheduled_execution() {
             max_executions: 1,
             execution_count: 0,
             policy_version: 0,
+            adapter: addr(&h.env),
             cancelled: false,
         });
 
@@ -663,6 +680,7 @@ fn cancelled_scheduled_payment_cannot_execute_end_to_end() {
             max_executions: 1,
             execution_count: 0,
             policy_version: 0,
+            adapter: addr(&h.env),
             cancelled: false,
         });
 
@@ -724,17 +742,28 @@ fn nonce_replay_protection_is_shared_across_transfer_and_split_operations() {
     );
 }
 
-/// Cross-contract edge case, and a real known limitation this session
-/// documented (`docs/V1_SCOPE.md`): the adapter bound to an operation is
-/// resolved at *execution* time, not pinned when the scheduled payment was
-/// approved. Reconfiguring `transfer`'s adapter between creation and
-/// execution silently redirects the payment through the new adapter. This
-/// test proves the documented risk is real, not just theoretical — an
-/// owner (or, in a real deployment, anyone able to reach `set_adapter`
-/// through the signer/policy model) can retarget an already-approved
-/// scheduled payment's execution path.
+/// Cross-contract edge case, and a real gap an independent security review
+/// (`docs/SMART_CONTRACT_AUDIT_REPORT.md` finding 1) confirmed: the adapter
+/// used to execute a scheduled payment used to be resolved at *execution*
+/// time via the treasury's then-current adapter configuration, not pinned
+/// when the payment was approved — so reconfiguring `transfer`'s adapter
+/// between creation and execution could silently redirect an
+/// already-approved payment through a different adapter. Fixed by pinning
+/// the adapter address on the `ScheduledIntent` at `create_scheduled_payment`
+/// time, mirroring how `policy_version` is already pinned.
+///
+/// This test proves the fix survives even a *fully applied* reconfiguration,
+/// not just a pending one (adapter changes are separately timelocked per
+/// finding 3 — see the `propose_adapter_change`/`apply_adapter_change`
+/// tests below for that mechanism on its own): `transfer`'s adapter is
+/// proposed and, once the change's own delay elapses, applied to an
+/// address that is not a valid `TransferAdapter` at all (so
+/// `execute_transfer` would trap if it were ever actually invoked).
+/// Execution still succeeds — proof it never consults the treasury's
+/// current adapter configuration and instead dispatches to the adapter
+/// pinned on the intent at creation.
 #[test]
-fn reconfiguring_the_adapter_after_intent_approval_redirects_execution() {
+fn scheduled_payment_uses_the_adapter_pinned_at_approval_not_a_later_reconfiguration() {
     let h = setup();
     let recipient = addr(&h.env);
     allow_payment(&h, &recipient);
@@ -748,29 +777,216 @@ fn reconfiguring_the_adapter_after_intent_approval_redirects_execution() {
             destination: recipient.clone(),
             amount: 100,
             start_ledger: 10,
-            end_ledger: 1000,
+            end_ledger: 20_000,
             max_executions: 1,
             execution_count: 0,
             policy_version: 0,
+            // Overwritten by `create_scheduled_payment` with the currently
+            // configured transfer_adapter regardless of what's supplied here.
+            adapter: addr(&h.env),
             cancelled: false,
         });
 
-    // A second, independently deployed TransferAdapter for the same
-    // treasury, swapped in after the intent was already approved.
-    let second_adapter_id = h.env.register(sta_transfer_adapter::TransferAdapter, ());
-    let second_adapter =
-        sta_transfer_adapter::TransferAdapterClient::new(&h.env, &second_adapter_id);
-    second_adapter.initialize(&h.owner, &h.smart_account.address);
+    // Propose, then (after the adapter-change delay elapses) apply a
+    // reconfiguration of `transfer` to an address with no `TransferAdapter`
+    // (or any) contract behind it at all — if execution ever resolved the
+    // adapter fresh instead of using the pinned one, this would trap.
+    let not_an_adapter = addr(&h.env);
     h.smart_account
-        .set_adapter(&Symbol::new(&h.env, "transfer"), &second_adapter_id);
+        .propose_adapter_change(&Symbol::new(&h.env, "transfer"), &not_an_adapter);
+    h.env.ledger().with_mut(|l| l.sequence_number = 10 + 17280);
+    h.smart_account
+        .apply_adapter_change(&Symbol::new(&h.env, "transfer"));
 
     h.env.mock_all_auths_allowing_non_root_auth();
     h.smart_account.execute_scheduled_payment(&intent_id, &1);
 
-    // The payment still succeeded — just routed through the *new* adapter
-    // instance rather than the one configured when the intent was approved.
     let token_client = TokenClient::new(&h.env, &h.token);
     assert_eq!(token_client.balance(&recipient), 100);
+}
+
+/// The mirror image of the test above: creating a schedule before any
+/// `transfer` adapter has ever been configured must fail fast, at creation
+/// time, rather than silently approving a schedule with nothing to pin.
+#[test]
+#[should_panic(expected = "Error(Contract, #8004)")]
+fn creating_a_scheduled_payment_before_an_adapter_is_configured_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let owner = addr(&env);
+    let policy_engine_id = env.register(sta_policy_engine::PolicyEngine, ());
+    sta_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id).initialize(&owner);
+    let intent_registry_id = env.register(sta_intent_registry::IntentRegistry, ());
+    let recovery_manager_id = env.register(sta_recovery_manager::RecoveryManager, ());
+    sta_recovery_manager::RecoveryManagerClient::new(&env, &recovery_manager_id)
+        .initialize(&owner, &1);
+
+    let smart_account_id = env.register(SmartAccountTreasury, ());
+    let smart_account = SmartAccountTreasuryClient::new(&env, &smart_account_id);
+    let founding_signer = Signer::Delegated(addr(&env));
+    smart_account.initialize(
+        &owner,
+        &vec![&env, founding_signer],
+        &Map::new(&env),
+        &policy_engine_id,
+        &intent_registry_id,
+        &recovery_manager_id,
+    );
+    // Deliberately never proposing/applying an adapter for "transfer".
+
+    smart_account.create_scheduled_payment(&ScheduledIntentArgs {
+        intent_id: soroban_sdk::BytesN::from_array(&env, &[77u8; 32]),
+        asset: addr(&env),
+        destination: addr(&env),
+        amount: 100,
+        start_ledger: 0,
+        end_ledger: 1000,
+        max_executions: 1,
+        execution_count: 0,
+        policy_version: 0,
+        adapter: addr(&env),
+        cancelled: false,
+    });
+}
+
+/// Independent security review finding (`docs/SMART_CONTRACT_AUDIT_REPORT.md`
+/// finding 3): adapter changes used to take effect immediately under
+/// single-owner control. This proves the timelock is real — applying
+/// before the delay has elapsed is rejected.
+#[test]
+fn adapter_change_cannot_be_applied_before_the_delay_elapses() {
+    let h = setup();
+    let new_adapter = addr(&h.env);
+    h.smart_account
+        .propose_adapter_change(&Symbol::new(&h.env, "transfer"), &new_adapter);
+
+    let too_early = h
+        .smart_account
+        .try_apply_adapter_change(&Symbol::new(&h.env, "transfer"));
+    assert_eq!(
+        too_early,
+        Err(Ok(SmartAccountTreasuryError::AdapterChangeDelayNotElapsed))
+    );
+}
+
+/// The owner can walk back an erroneous or no-longer-wanted proposal
+/// before it takes effect — mirrors `recovery_manager::cancel_recovery`'s
+/// existing pattern for open recovery requests.
+#[test]
+fn adapter_change_can_be_cancelled_before_it_takes_effect() {
+    let h = setup();
+    let new_adapter = addr(&h.env);
+    h.smart_account
+        .propose_adapter_change(&Symbol::new(&h.env, "transfer"), &new_adapter);
+    h.smart_account
+        .cancel_adapter_change(&Symbol::new(&h.env, "transfer"));
+
+    h.env.ledger().with_mut(|l| l.sequence_number = 17280);
+    let no_pending = h
+        .smart_account
+        .try_apply_adapter_change(&Symbol::new(&h.env, "transfer"));
+    assert_eq!(
+        no_pending,
+        Err(Ok(SmartAccountTreasuryError::NoPendingAdapterChange))
+    );
+}
+
+#[test]
+fn cancel_adapter_change_rejects_when_nothing_is_pending() {
+    let h = setup();
+    let err = h
+        .smart_account
+        .try_cancel_adapter_change(&Symbol::new(&h.env, "transfer"));
+    assert_eq!(
+        err,
+        Err(Ok(SmartAccountTreasuryError::NoPendingAdapterChange))
+    );
+}
+
+/// The authorization decision already happened at proposal time
+/// (an owner-gated call); applying an already-authorized, delay-elapsed
+/// change is deliberately permissionless — same pattern as
+/// `apply_recovery`/`apply_guardian_freeze`. Proven here with zero mocked
+/// or real authorization at all.
+#[test]
+fn applying_an_adapter_change_needs_no_authorization() {
+    let h = setup();
+    let new_adapter = addr(&h.env);
+    h.smart_account
+        .propose_adapter_change(&Symbol::new(&h.env, "transfer"), &new_adapter);
+
+    h.env.ledger().with_mut(|l| l.sequence_number = 17280);
+    h.env.set_auths(&[]);
+    h.smart_account
+        .apply_adapter_change(&Symbol::new(&h.env, "transfer"));
+}
+
+/// Independent review finding: `propose_adapter_change` wrote the pending
+/// proposal into instance storage without explicitly extending the
+/// instance TTL. Since instance storage shares one TTL across all of this
+/// contract's own config, a proposal made on an otherwise-dormant treasury
+/// could archive before anyone calls `apply_adapter_change`, silently
+/// losing a legitimate governance action instead of merely delaying it —
+/// a liveness bug, not a fund-draining one, but still a real gap in the
+/// "delay then apply" contract the timelock is supposed to provide. This
+/// proves `propose_adapter_change` (and, since they touch the same shared
+/// TTL, `apply_adapter_change`) actually refresh it.
+#[test]
+fn propose_and_apply_adapter_change_extend_the_instance_ttl() {
+    let h = setup();
+    let new_adapter = addr(&h.env);
+
+    let ttl_before = h.env.as_contract(&h.smart_account.address, || {
+        h.env.storage().instance().get_ttl()
+    });
+    assert!(ttl_before >= crate::TTL_THRESHOLD_LEDGERS);
+
+    h.env
+        .ledger()
+        .with_mut(|l| l.sequence_number += crate::TTL_THRESHOLD_LEDGERS / 2);
+    h.smart_account
+        .propose_adapter_change(&Symbol::new(&h.env, "transfer"), &new_adapter);
+
+    let ttl_after_propose = h.env.as_contract(&h.smart_account.address, || {
+        h.env.storage().instance().get_ttl()
+    });
+    assert!(ttl_after_propose >= crate::TTL_THRESHOLD_LEDGERS);
+
+    h.env
+        .ledger()
+        .with_mut(|l| l.sequence_number += crate::TTL_THRESHOLD_LEDGERS / 2);
+    h.smart_account
+        .apply_adapter_change(&Symbol::new(&h.env, "transfer"));
+
+    let ttl_after_apply = h.env.as_contract(&h.smart_account.address, || {
+        h.env.storage().instance().get_ttl()
+    });
+    assert!(ttl_after_apply >= crate::TTL_THRESHOLD_LEDGERS);
+}
+
+/// Independent review finding: an otherwise fully dormant treasury (no
+/// owner action of any kind) has no way to keep a pending adapter proposal
+/// alive beyond the one bump `propose_adapter_change` makes at creation
+/// time. `extend_instance_ttl` closes that: permissionless, no auth
+/// required, extends no authority.
+#[test]
+fn extend_instance_ttl_is_permissionless_and_refreshes_ttl() {
+    let h = setup();
+    let new_adapter = addr(&h.env);
+    h.smart_account
+        .propose_adapter_change(&Symbol::new(&h.env, "transfer"), &new_adapter);
+
+    h.env
+        .ledger()
+        .with_mut(|l| l.sequence_number += crate::TTL_THRESHOLD_LEDGERS / 2);
+    h.env.set_auths(&[]);
+    h.smart_account.extend_instance_ttl();
+
+    let ttl_after = h.env.as_contract(&h.smart_account.address, || {
+        h.env.storage().instance().get_ttl()
+    });
+    assert!(ttl_after >= crate::TTL_THRESHOLD_LEDGERS);
 }
 
 /// Real gap this session found: `docs/TECHNICAL_ARCHITECTURE.md` §12.7's

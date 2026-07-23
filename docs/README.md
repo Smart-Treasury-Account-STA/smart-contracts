@@ -9,6 +9,8 @@ This folder documents the current **V1 implementation** in `contracts/`. Everyth
 3. **[`SMART_CONTRACT_SPECIFICATION.md`](SMART_CONTRACT_SPECIFICATION.md)** — per-module contract design and responsibilities, with a mapping table showing which `contracts/*` package implements which module.
 4. **[`TECHNICAL_ARCHITECTURE.md`](TECHNICAL_ARCHITECTURE.md)** — the full target-state Smart Treasury Account architecture (dApp, SDK, relayer, and all onchain modules). This document describes the complete product, not just this repository's scope — §1.2 states exactly which pieces this repository implements today.
 5. **[`TESTNET_DEPLOYMENT.md`](TESTNET_DEPLOYMENT.md)** — live V1 deployment record on Stellar testnet: real contract addresses, transactions, and one explicitly named limitation on what a bare CLI deployment can and can't exercise.
+6. **[`SMART_CONTRACT_AUDIT_REPORT.md`](SMART_CONTRACT_AUDIT_REPORT.md)** — an independently produced review of the workspace. All three findings were confirmed against the actual code and fixed; `V1_SCOPE.md` §6 records the verdict and fix for each — read that section alongside this file, not instead of it.
+7. **[`GOVERNANCE_MULTISIG_DESIGN.md`](GOVERNANCE_MULTISIG_DESIGN.md)** — design notes (not implemented) for distributing the admin/owner role itself across multiple keys, the one item from the review above left as a named V1 boundary rather than fixed.
 
 ## Not part of the current review
 
@@ -18,7 +20,7 @@ This folder documents the current **V1 implementation** in `contracts/`. Everyth
 
 | Question | Where to look |
 |---|---|
-| "What did the security review find?" | `V1_SCOPE.md` §4 and §5 |
+| "What did the security review find?" | `V1_SCOPE.md` §4, §5, and §6 |
 | "How do I run the tests and check coverage?" | `V1_REVIEW_GUIDE.md` → Verification Commands |
 | "Which contract implements module X?" | `SMART_CONTRACT_SPECIFICATION.md` §1.1 |
 | "Is this deployed anywhere I can check independently?" | `TESTNET_DEPLOYMENT.md` |

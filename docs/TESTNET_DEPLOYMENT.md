@@ -1,8 +1,8 @@
 # Smart Treasury Account V1 Testnet Deployment
 
-This is the live deployment record for the current V1 workspace (`docs/V1_SCOPE.md`), deployed 2026-07-18, `soroban-sdk 26.1.0`, with the OpenZeppelin Stellar contract composition. The earlier PoC deployment (`smart_account_poc`, `policy_registry_poc`, `intent_registry_poc`, `recovery_guard_poc` on `soroban-sdk 22.0.1`) that used to be recorded in this same file has been moved to [`docs/archive/POC_TESTNET_DEPLOYMENT.md`](archive/POC_TESTNET_DEPLOYMENT.md) — see [§9](#9-prior-poc-deployment).
+This is the live deployment record for the V1 workspace as it stood on 2026-07-23 — the version with all three independent-review findings fixed (adapter pinning, timelocked adapter/guardian changes, the instance-TTL fix on the timelock code itself) and every event migrated to `#[contractevent]`. This **replaces** the 2026-07-18 deployment, which predated all of that and is now stale relative to source (entrypoint names, event shapes, and TTL behavior all differed). `soroban-sdk 26.1.0`, OpenZeppelin Stellar contract composition throughout. The earlier PoC deployment (`smart_account_poc`, `policy_registry_poc`, `intent_registry_poc`, `recovery_guard_poc` on `soroban-sdk 22.0.1`) remains archived separately — see [§9](#9-prior-poc-deployment).
 
-Reproduce this deployment with `scripts/deploy_testnet.sh` (idempotent-ish: re-running `initialize` calls against already-initialized contracts will fail with `AlreadyInitialized`, which is expected).
+Reproduce with `scripts/deploy_testnet.sh` (idempotent-ish: re-running `initialize` calls against already-initialized contracts fails with `AlreadyInitialized`, which is expected; re-running the test-asset deploy step now looks up the existing deterministic SAC address instead of failing, a fix landed as part of this deployment — see §8).
 
 ## 1. Deployment Summary
 
@@ -11,7 +11,7 @@ Reproduce this deployment with `scripts/deploy_testnet.sh` (idempotent-ish: re-r
 | Network | Stellar Testnet |
 | Network passphrase | `Test SDF Network ; September 2015` |
 | Stellar CLI version | `stellar 26.0.0` |
-| Deployment date | 2026-07-18 |
+| Deployment date | 2026-07-23 |
 | Deployer identity | `sta-testnet-deployer` |
 | Deployer public key | `GCWFJKLE45TMVZS42TMIYKAORKGBWE74753YPOSCC5ESJR2G2UMBXBDB` |
 
@@ -21,16 +21,18 @@ The deployed contracts are the full V1 workspace: all 7 packages, composing real
 
 | Contract | Testnet contract ID | Explorer |
 |---|---|---|
-| `webauthn_verifier` | `CBD3TLL3AWBKV4K4XGLHJKQJXLJENFISR27JCXI3RNS3P7SFTIN4BMQW` | [Explorer](https://stellar.expert/explorer/testnet/contract/CBD3TLL3AWBKV4K4XGLHJKQJXLJENFISR27JCXI3RNS3P7SFTIN4BMQW) |
-| `policy_engine` | `CDE5ZGZI2BTA5YH22KDD5WNDJRXS3E4M5QGLGGZD4UYM5A4NHKF7GZP3` | [Explorer](https://stellar.expert/explorer/testnet/contract/CDE5ZGZI2BTA5YH22KDD5WNDJRXS3E4M5QGLGGZD4UYM5A4NHKF7GZP3) |
-| `intent_registry` | `CBOH2FR7KRRFPZCZ3V5BF3VL7GGD7D6BQTDN42JH7UA4HGN4JPT2QQXQ` | [Explorer](https://stellar.expert/explorer/testnet/contract/CBOH2FR7KRRFPZCZ3V5BF3VL7GGD7D6BQTDN42JH7UA4HGN4JPT2QQXQ) |
-| `recovery_manager` | `CDPU6PUAFUCGIOHAU3UIW2MU3WO5MUFU43UZBVX5DZPODCQCG6DIVBCQ` | [Explorer](https://stellar.expert/explorer/testnet/contract/CDPU6PUAFUCGIOHAU3UIW2MU3WO5MUFU43UZBVX5DZPODCQCG6DIVBCQ) |
-| `smart_account` | `CCK7SMLYWIWVTRMIATD6W44QTEK7OMZCZNDSSJPPNQWK7X4IHB5X3W5G` | [Explorer](https://stellar.expert/explorer/testnet/contract/CCK7SMLYWIWVTRMIATD6W44QTEK7OMZCZNDSSJPPNQWK7X4IHB5X3W5G) |
-| `transfer_adapter` | `CDTTFTQK5OPJ5BUYZJTWQPISYKTIK5R55MYIWDDCTTCTLPSHRDJO7OJY` | [Explorer](https://stellar.expert/explorer/testnet/contract/CDTTFTQK5OPJ5BUYZJTWQPISYKTIK5R55MYIWDDCTTCTLPSHRDJO7OJY) |
-| `split_adapter` | `CB2ZBM2AMBSONEEBTSVONTHYYGX7WESQX6TJDHV6SFSUBP4J6NCZSF3Y` | [Explorer](https://stellar.expert/explorer/testnet/contract/CB2ZBM2AMBSONEEBTSVONTHYYGX7WESQX6TJDHV6SFSUBP4J6NCZSF3Y) |
+| `webauthn_verifier` | `CD72MKTDNI3HLMNPA4YUOZGLT2NUWLVHTW3A7NQOXGLG7OKIKETSMXXR` | [Explorer](https://stellar.expert/explorer/testnet/contract/CD72MKTDNI3HLMNPA4YUOZGLT2NUWLVHTW3A7NQOXGLG7OKIKETSMXXR) |
+| `policy_engine` | `CC5FSUNWBNH3EIEELHO3A4ZPJZRAZCVMFNP3PVXO2YBWDNNLTFLWBVHC` | [Explorer](https://stellar.expert/explorer/testnet/contract/CC5FSUNWBNH3EIEELHO3A4ZPJZRAZCVMFNP3PVXO2YBWDNNLTFLWBVHC) |
+| `intent_registry` | `CDHTNPBXUMPCKUJ76HQ767MDRD4IVRRH4H5DOF4JUOO36QKSV4GXFRMR` | [Explorer](https://stellar.expert/explorer/testnet/contract/CDHTNPBXUMPCKUJ76HQ767MDRD4IVRRH4H5DOF4JUOO36QKSV4GXFRMR) |
+| `recovery_manager` | `CALI5XJASA66LKZPF3ZF7HOLGOFUWZYIHB6SENXCZ5Y7QVT7UQKKR6UM` | [Explorer](https://stellar.expert/explorer/testnet/contract/CALI5XJASA66LKZPF3ZF7HOLGOFUWZYIHB6SENXCZ5Y7QVT7UQKKR6UM) |
+| `smart_account` | `CB4KZJ3I4XANE6GWPAMXCNXQ34PTQWPXVKFBBMLNKV25GAOXQC7RQUMS` | [Explorer](https://stellar.expert/explorer/testnet/contract/CB4KZJ3I4XANE6GWPAMXCNXQ34PTQWPXVKFBBMLNKV25GAOXQC7RQUMS) |
+| `transfer_adapter` | `CAX766XYR56WO7Y4HFOHYQUO5AIN5QLHAHKJ3DINXM2WUQY5UE7KGE26` | [Explorer](https://stellar.expert/explorer/testnet/contract/CAX766XYR56WO7Y4HFOHYQUO5AIN5QLHAHKJ3DINXM2WUQY5UE7KGE26) |
+| `split_adapter` | `CAFTFU2E4MGZT6BLCVN2FAQB6GIBJRR5ICI7C7LZEMACBDUUTQKVHHV3` | [Explorer](https://stellar.expert/explorer/testnet/contract/CAFTFU2E4MGZT6BLCVN2FAQB6GIBJRR5ICI7C7LZEMACBDUUTQKVHHV3) |
 | `STA` test asset (SAC) | `CCOUVA654JH2V6B7LNTKHJP5DF3QA553RS2IIWXSGPDFH2N3QILIVU5L` | [Explorer](https://stellar.expert/explorer/testnet/contract/CCOUVA654JH2V6B7LNTKHJP5DF3QA553RS2IIWXSGPDFH2N3QILIVU5L) |
 
-Auxiliary testnet identities used only as `Address` values (not funded, not signing anything): guardian `GDXVIRLSBDKT7EZM2RM3FH26W3TPF77IJ7GZBA5IOA6ZJBTW26NNO3AV`, recipient `GAK3XILRBYBMBOCZMSLL2CLR6WPQLEIOC6ZCYYPTE4OIAX3PCFFO2YMU`.
+The `STA` test asset kept the *same* contract ID as the 2026-07-18 deployment — SAC addresses are deterministic (derived from issuer + asset code), so redeploying the same code from the same deployer resolves to the same contract rather than creating a new one; this run looked it up and reused it rather than re-deploying.
+
+Auxiliary testnet identities used only as `Address` values (not funded, not signing anything): guardian `GDXVIRLSBDKT7EZM2RM3FH26W3TPF77IJ7GZBA5IOA6ZJBTW26NNO3AV`, recipient `GAK3XILRBYBMBOCZMSLL2CLR6WPQLEIOC6ZCYYPTE4OIAX3PCFFO2YMU` (same identities reused from the prior deployment).
 
 ## 3. WASM Artifacts
 
@@ -38,78 +40,118 @@ Built with `stellar contract build --optimize --out-dir wasm`:
 
 | Contract | WASM hash |
 |---|---|
-| `webauthn_verifier` | `2a56f2fbdaa56f6b5f138ba05b868116ae105b32b31b7ed4ee122ce9902e67f8` |
-| `policy_engine` | `291ae10e032c7219ed48496eb71deb8c6f63ceb4d679f2df68f45a2fcefd4160` |
-| `intent_registry` | `ec50b7d59e3af2a69d79d153c0f3d54f96685cfb1125fc8f30da5dc4685b1032` |
-| `recovery_manager` | `e6dc1f87b44f411957db7eed5323d5514ca519470dca395cd689022b0c0142c7` |
-| `smart_account` | `a3d7a29849c98e5d1a4d397c27d4806121a46f770c6a99e43454975ef0ce3926` |
-| `transfer_adapter` | `922f52e51e6cbb973f6030692da76e036aac9ab929731b302a4311948fc5bcf6` |
-| `split_adapter` | `63853a3c06519e701f98252c76c5d8d65b52237f92cf16c6f0631e3f1a84a78c` |
+| `webauthn_verifier` | `2a56f2fbdaa56f6b5f138ba05b868116ae105b32b31b7ed4ee122ce9902e67f8` (unchanged — source hasn't changed since the prior deployment) |
+| `policy_engine` | `d5a566d8dec16bf4d2687a0b56d2d759b8e2d759c6000d7f739f45d0eb110191` |
+| `intent_registry` | `e67dab201bce0ef769b3d02d9a5f0e23149b97e1f9d2ef9e5b84ad335b03fa31` |
+| `recovery_manager` | `a0f22448c139298880af1b33e935ca6c5bf810f37f126e9d190eb466e86b7515` |
+| `smart_account` | `1899840dd9c80a272c7141e82d97f88b29f011c1c06cf3fdab14afbdcaae1356` |
+| `transfer_adapter` | `49d963dfbe1ce17dd309a4f6502eaf26298b7effa40ef156ed824a0bb28cc1e7` |
+| `split_adapter` | `55d8356b78d1fa6a79fc0586d595b20e686495ba87664cde89d7a317a83d1d88` |
 
 ## 4. Deployment Transactions
 
-Each deployment has two transactions: WASM upload, then contract instance creation.
+Each deployment has two transactions: WASM upload, then contract instance creation. `webauthn_verifier`'s WASM was already uploaded from the prior deployment (identical source), so it only needed the instance-creation transaction.
 
 | Contract | WASM upload | Contract create |
 |---|---|---|
-| `webauthn_verifier` | [`8078be84...`](https://stellar.expert/explorer/testnet/tx/8078be8424286250dc05ec900284943f154eb67ffd2cc7c05183e296d4b6c887) | [`56f3e34f...`](https://stellar.expert/explorer/testnet/tx/56f3e34f989adf14430c03f2c649a6ce0fb500d8aaa28881b40d504e4d237db1) |
-| `policy_engine` | [`39a61749...`](https://stellar.expert/explorer/testnet/tx/39a61749945a7bdad9f4e767290e12d96a04f3128ce16d7b7a8ca43131d7a62f) | [`63b35ccb...`](https://stellar.expert/explorer/testnet/tx/63b35ccbc656da932b002033151507b472fe223a93f2760fc59cf89c8f72c1e2) |
-| `intent_registry` | [`7c2acbc6...`](https://stellar.expert/explorer/testnet/tx/7c2acbc65409056362efbbadd1c7f59d8c7bfc91259ce815cd4d81dcb068f7fb) | [`01292ae0...`](https://stellar.expert/explorer/testnet/tx/01292ae00b649b1499a48ea3d1f78aabd840023094fa51af845db2f3fe2950d5) |
-| `recovery_manager` | [`f23406fd...`](https://stellar.expert/explorer/testnet/tx/f23406fdab508b397204399962372c9843865a76fa2342ccaf849e69d1a73f33) | [`badd941e...`](https://stellar.expert/explorer/testnet/tx/badd941e4d240f73ecb2b991195170e6d03b7579f4e0a8b8f6e553e912f6cce1) |
-| `smart_account` | [`2ae4cea9...`](https://stellar.expert/explorer/testnet/tx/2ae4cea97473a2e4eed3ac79e4c7d3479a5ef685431602f970d39542a55aa70e) | [`e55adda4...`](https://stellar.expert/explorer/testnet/tx/e55adda4a8ac77fdf56f320d7fd9a695facb4b0eea2c2fd2fff763b557e933e2) |
-| `transfer_adapter` | [`4515e27b...`](https://stellar.expert/explorer/testnet/tx/4515e27bcf23647e16a76b5b831772cd7ecaf4aa71a116d2e2a7ba035d24f31f) | [`923f05c9...`](https://stellar.expert/explorer/testnet/tx/923f05c9ad9e6604684a1fe837bb389eb079fdc577e8fcd9a2ef2733a6a18dd0) |
-| `split_adapter` | [`327e35d5...`](https://stellar.expert/explorer/testnet/tx/327e35d5626d9df0d07139b3ab472665cfd57b24050847811bdc4717af0e2521) | [`25a74f60...`](https://stellar.expert/explorer/testnet/tx/25a74f60be8aad879136d5cf251896e54e22bf111869ec44909cc3b1edb961b9) |
+| `webauthn_verifier` | *(reused, already uploaded)* | [`0ef8a0e0...`](https://stellar.expert/explorer/testnet/tx/0ef8a0e0335e67a9b27e856ea90d7603a40ec1a3eaf8f915a732c206410b113e) |
+| `policy_engine` | [`b08d7ee4...`](https://stellar.expert/explorer/testnet/tx/b08d7ee46ee9248886d1c6953b46aa7a6d04e130c81ccb18a162e2465eef6666) | [`77bec183...`](https://stellar.expert/explorer/testnet/tx/77bec1830d1c377d0a50d7ea857955c3959e7b1c1f431936c0ab68e12f9b0997) |
+| `intent_registry` | [`b115fd30...`](https://stellar.expert/explorer/testnet/tx/b115fd30ea19c4e7c198f59b7238957d41b1603f2542141d0f27e783f66779e3) | [`d2f4a1c9...`](https://stellar.expert/explorer/testnet/tx/d2f4a1c9ddd07dc454be8206e86379d427d2543fd4c4edfad05c3abfe0e8f757) |
+| `recovery_manager` | [`0174acb4...`](https://stellar.expert/explorer/testnet/tx/0174acb485cffef3c858d7154ccee1ac94da50e28c7b428706e796e32715afd1) | [`5e0edf45...`](https://stellar.expert/explorer/testnet/tx/5e0edf45983a9709698ca0cd25d823e34e5daa9883adbf3d802688805b317592) |
+| `smart_account` | [`48fffb41...`](https://stellar.expert/explorer/testnet/tx/48fffb41934eccac559f0eea59abe1934d8e665f9bf9242268d3c83b79c0f48b) | [`38f93345...`](https://stellar.expert/explorer/testnet/tx/38f9334501d3aa0cf425a1580a9c22a4a6e885180759d9bf91f8009fe9dd733b) |
+| `transfer_adapter` | [`f5e076be...`](https://stellar.expert/explorer/testnet/tx/f5e076beee3e5025550ae6e483d535b2dac47d382993df0015dfddf9121fd0fe) | [`b2968b47...`](https://stellar.expert/explorer/testnet/tx/b2968b476192df488bee0fd08d84ad9b5fe200ac8f648926afef2e66f5a4de6c) |
+| `split_adapter` | [`ef904342...`](https://stellar.expert/explorer/testnet/tx/ef904342946d7e0b71034463742d3f6a92b7a38ece880af2b37d2c73e9ad777d) | [`5aef3b2c...`](https://stellar.expert/explorer/testnet/tx/5aef3b2c0c7b52c5713691eccdaee369583d0079d458c3aa997883456c2bf483) |
 
 ## 5. Initialization and Wiring Transactions
 
 | Step | Transaction | Result |
 |---|---|---|
-| `policy_engine.initialize` | [`029850...`](https://stellar.expert/explorer/testnet/tx/029850467cf70e52183404691ffcad6f30be88770f23be3330b2b72e0db7d341) | Admin set to deployer, policy version initialized to `1` |
-| `recovery_manager.initialize` | [`e2c443...`](https://stellar.expert/explorer/testnet/tx/e2c44372e5adfa451c313899b408faabea8f0c45d253b6031d3d2dc6d0766172) | Admin set to deployer, guardian threshold set to `1` |
-| `smart_account.initialize` | [`4da678...`](https://stellar.expert/explorer/testnet/tx/4da678921489c89a6b5fd6a8588867bc5402c1fb9dae9ffa802b01b4320ac324) | Owner set to deployer; founding signer registered as `Signer::Delegated(deployer)` under context rule `0`; `policy_engine`/`intent_registry`/`recovery_manager` addresses pinned |
-| `smart_account.set_adapter(transfer)` | [`b3de63...`](https://stellar.expert/explorer/testnet/tx/b3de63dc06623e8629b64e40f9cf9e510162babfa37b09c7b97304d1e5ba36e8) | `transfer_adapter` wired for the `transfer` operation |
-| `smart_account.set_adapter(split)` | [`727efa...`](https://stellar.expert/explorer/testnet/tx/727efabb257340a3a23a70f6d2c80b811f20a89a3b75771e189e982d82737a75) | `split_adapter` wired for the `split` operation |
-| `recovery_manager.add_guardian` | [`d6cf5c...`](https://stellar.expert/explorer/testnet/tx/d6cf5cc7aa3c9d22ff87f197dd33779353ed46d0d7b420f8161cf4ef61785e7b) | Guardian registered, active after the standard activation delay |
-| `policy_engine.set_asset_rule` | [`2f4a38...`](https://stellar.expert/explorer/testnet/tx/2f4a38d7bfdf2c5cdf585f6d79eb8a166265e22f035dea3cdbb5ea29d5f1de80) | `STA` test asset enabled, max single transfer `10,000,000` |
-| `policy_engine.set_recipient_allowed` | [`5627d2...`](https://stellar.expert/explorer/testnet/tx/5627d247f751c5c6b5f5bed020284a8dace0ef69f957e7eb5ea25715bfa01d0b) | Test recipient allowed |
-| `policy_engine.set_operation_allowed(transfer)` | [`50b243...`](https://stellar.expert/explorer/testnet/tx/50b243258fcf2c1ed885b53bb8f8ab93963812753126f5f8e578f1b06142e47b) | `transfer` operation enabled |
-| `policy_engine.set_operation_allowed(split)` | [`3a606d...`](https://stellar.expert/explorer/testnet/tx/3a606d1d39861f477f02f803ac75b4d98a6cb05f571daf4eaa991fa112b19d30) | `split` operation enabled |
-| Mint `STA` to `smart_account` | [`8d0a9c...`](https://stellar.expert/explorer/testnet/tx/8d0a9c996bf00c687a682f4413c278b853949b6c882a708ba17a949596220fb6) | `1,000,000,000` units minted to the treasury |
+| `policy_engine.initialize` | [`faa050d4...`](https://stellar.expert/explorer/testnet/tx/faa050d4f67fdf66fd533fb5a759cfd852748ee6e091040aaad877b2e70d362a) | Admin set to deployer, policy version initialized to `1` — `Initialized(admin)` event |
+| `recovery_manager.initialize` | [`3c3b9dfd...`](https://stellar.expert/explorer/testnet/tx/3c3b9dfd3111d4c7a5c468281dfa6c393924b4aaf38f791134cdee18b7428625) | Admin set to deployer, guardian threshold set to `1` — `Initialized(admin, guardian_threshold)` event |
+| `transfer_adapter.initialize` | [`0f3ac883...`](https://stellar.expert/explorer/testnet/tx/0f3ac883c86bbc4c441fb9ad3772c68ed4a46ef8295b4ea11829f28446e816ed) | Pinned to `smart_account` |
+| `split_adapter.initialize` | [`7848933c...`](https://stellar.expert/explorer/testnet/tx/7848933c9f36016d93d55b2e32a2755457659a6ab6598985721a5f3efb627915) | Pinned to `smart_account` |
+| `smart_account.initialize` | [`1f4fbd12...`](https://stellar.expert/explorer/testnet/tx/1f4fbd12802b0af5e54cff741ad22bb6877fd398a064dbf482fcf3ab7128c01c) | Owner set to deployer; founding signer registered as `Signer::Delegated(deployer)` under context rule `0`; `policy_engine`/`intent_registry`/`recovery_manager` addresses pinned — `SignerRegistered`, `ContextRuleAdded`, `Initialized(owner)` events |
+| `smart_account.propose_adapter_change(transfer)` | [`8aac2ebf...`](https://stellar.expert/explorer/testnet/tx/8aac2ebf6696f95b48013473c87b5301a188b221699a175b31fdc4a70fbf475b) | `transfer_adapter` proposed; effective ledger `3768351` (~1 day timelock) |
+| `smart_account.propose_adapter_change(split)` | [`5ffeb135...`](https://stellar.expert/explorer/testnet/tx/5ffeb1355fe29cb03f06355fc21ac3a4a53be5806685e506e3d519b369b1aca9) | `split_adapter` proposed; effective ledger `3768353` |
+| `recovery_manager.add_guardian` | [`4aa6f6ac...`](https://stellar.expert/explorer/testnet/tx/4aa6f6aceb901e58bd79bce8437b4bb5983a343bedb42cc1a5629fdd8f64450d) | Guardian registered; activates at ledger `3768355` |
+| Mint `STA` to `smart_account` | [`a4c7e17d...`](https://stellar.expert/explorer/testnet/tx/a4c7e17dbeeccad4a60fb72245581c251510f75cf061527dcc48f4d7ca1e947f) | `1,000,000,000` units minted to the treasury |
+| `policy_engine.set_asset_rule` | [`541be3a0...`](https://stellar.expert/explorer/testnet/tx/541be3a057fa740f199ca6ae964fe340567e180003cb2889cb59c026748fc760) | `STA` test asset enabled, max single transfer `10,000,000` |
+| `policy_engine.set_recipient_allowed` | [`124ecc8b...`](https://stellar.expert/explorer/testnet/tx/124ecc8b1debb655c60f525c346f077ee93273f82c2948cce6fcf56d51f1a7c9) | Test recipient allowed |
+| `policy_engine.set_operation_allowed(transfer)` | [`bc986459...`](https://stellar.expert/explorer/testnet/tx/bc986459086610eddbc8b9db20024d3f9246f21c3bf21375935b503c6f319dcf) | `transfer` operation enabled |
+| `policy_engine.set_operation_allowed(split)` | [`26d8d823...`](https://stellar.expert/explorer/testnet/tx/26d8d8239d81db149b90a86f2bef32f254ae0a5d6faa1f3eb28b90c60d606054) | `split` operation enabled |
 
-`intent_registry` is deployed but **deliberately left uninitialized** — see [§7](#7-known-limitation-intent_registry-and-signer-gated-entrypoints).
+Every event above was emitted via the new `#[contractevent]` structs (not the old raw-tuple `Events::publish` calls) — confirmed directly from the CLI's event-decoding output during this deployment, e.g. `Initialized (init), admin: "...", guardian_threshold: 1` for `recovery_manager`, matching the typed struct fields rather than an untyped tuple.
+
+The two `propose_adapter_change` calls do not take effect until their effective ledger is reached (~1 day). Once past ledger `3768351`/`3768353` respectively, run:
+
+```bash
+stellar contract invoke --id CB4KZJ3I4XANE6GWPAMXCNXQ34PTQWPXVKFBBMLNKV25GAOXQC7RQUMS --source sta-testnet-deployer --network testnet -- apply_adapter_change --operation transfer
+stellar contract invoke --id CB4KZJ3I4XANE6GWPAMXCNXQ34PTQWPXVKFBBMLNKV25GAOXQC7RQUMS --source sta-testnet-deployer --network testnet -- apply_adapter_change --operation split
+```
+
+`intent_registry` was initially deployed uninitialized, then bootstrapped separately (admin = `smart_account`) — see §6.3 and [§7](#7-known-limitation-signer-gated-interactive-entrypoints).
 
 ## 6. Demonstrated Testnet Flows
 
 ### 6.1 Valid and invalid `policy_engine.validate_policy` calls, live on-chain
 
-`validate_policy` is permissionless by design (any caller may check whether a hypothetical payment would pass — the actual authorization happens at `smart_account`), which makes it directly demonstrable via CLI without any signer setup:
-
-All three calls were made read-only (`--send=no`, RPC simulation against live testnet state — no transaction hash, since nothing is written for a check that doesn't mutate storage):
+`validate_policy` is permissionless by design (any caller may check whether a hypothetical payment would pass — the actual authorization happens at `smart_account`), which makes it directly demonstrable via CLI without any signer setup. All calls below were read-only (`--send=no`, RPC simulation against live testnet state — no transaction hash, since nothing is written for a check that doesn't mutate storage):
 
 | Check | Result |
 |---|---|
-| `transfer` of `5,000,000` of `STA` to the allowed recipient, version `1` | ✅ Success — `pol_ok` event emitted |
+| `transfer` of `5,000,000` of `STA` to the allowed recipient, version `1` | ✅ Success — `PolicyValidated (pol_ok)` event: `operation: "transfer", asset: "CCOUVA6...", destination: "GAK3XIL...", amount: "5000000", expected_version: 1` |
 | Same, but destination = deployer (never allowlisted as a recipient) | ❌ Rejected: `Error(Contract, #2004)` (`RecipientNotAllowed`) |
 | Same, but amount `20,000,000` (above the `10,000,000` cap) | ❌ Rejected: `Error(Contract, #2005)` (`AmountAboveLimit`) |
 
-This concretely proves, on live testnet rather than only in the local test suite, that policy checks fail closed for both an unapproved recipient and an over-cap amount.
+This concretely proves, on live testnet rather than only in the local test suite, that policy checks fail closed for both an unapproved recipient and an over-cap amount — and that the new `PolicyValidated` event (from the `#[contractevent]` migration) carries the full named-field data the old raw tuple didn't expose as clearly.
 
-### 6.2 `smart_account.status()`
+### 6.2 Read-only state checks, live on-chain
 
-```json
+```bash
+$ stellar contract invoke --id CB4KZJ3I4XANE6GWPAMXCNXQ34PTQWPXVKFBBMLNKV25GAOXQC7RQUMS ... -- status
 {"frozen":false,"initialized":true,"paused":false,"policy_version_hint":0}
+
+$ stellar contract invoke --id CALI5XJASA66LKZPF3ZF7HOLGOFUWZYIHB6SENXCZ5Y7QVT7UQKKR6UM ... -- is_guardian --guardian GDXVIRLSBDKT7EZM2RM3FH26W3TPF77IJ7GZBA5IOA6ZJBTW26NNO3AV
+true
+
+$ stellar contract invoke --id CC5FSUNWBNH3EIEELHO3A4ZPJZRAZCVMFNP3PVXO2YBWDNNLTFLWBVHC ... -- version
+1
 ```
 
-## 7. Known limitation: `intent_registry` and signer-gated entrypoints
+All three read back exactly the state written during initialization/wiring above: the treasury is initialized, not paused, not frozen; the registered guardian is recognized; the policy version is still `1` (unchanged from initialization, as expected — nothing in this deployment bumped it).
 
-Every entrypoint on `smart_account` that spends treasury funds or creates scheduled automation — `execute_transfer_payment`, `execute_split_payment`, `create_scheduled_payment`, `cancel_scheduled_payment`, and the composed `ExecutionEntryPoint::execute` — calls `env.current_contract_address().require_auth()`. Because `smart_account` is a Soroban **custom account** (`CustomAccountInterface::__check_auth` delegating to `stellar_accounts::smart_account::do_check_auth`), satisfying that `require_auth()` requires a correctly-constructed `AuthPayload` (a `Map<Signer, Bytes>` of signer proofs plus the matched `context_rule_ids`) — not a plain Ed25519 transaction signature. Building that payload off-chain (matching the registered signer, whether an Ed25519 wallet key or a passkey) is exactly the job of a wallet/dApp/SDK client — the layer `docs/V1_SCOPE.md` explicitly lists under "Not Yet Included in V1." The `stellar` CLI has no built-in support for constructing third-party custom-account authorization schemes, so it cannot drive these entrypoints on its own.
+### 6.3 `intent_registry` bootstrapped with a hand-built custom-account authorization
+
+`intent_registry`'s `admin` must be `smart_account` itself (`contracts/smart_account/src/lib.rs`'s `create_intent`/`cancel_intent` call `IntentRegistryClient::create_intent`/`cancel_intent` directly, both `ensure_admin`-gated on the intent_registry side). So `intent_registry.initialize(admin=smart_account)`'s `admin.require_auth()` requires authorization *from `smart_account`* — a Soroban custom account, not a plain keypair — which the bare `stellar` CLI cannot produce (see §7).
+
+`scripts/bootstrap_intent_registry.py` closes this gap for this one bootstrapping call by hand-constructing the two Soroban authorization entries `do_check_auth`/`authenticate` (`stellar-accounts-0.7.2/src/smart_account/storage.rs`) actually require, without any wallet/SDK layer:
+
+1. An `Address` credentials entry for `smart_account`, whose `signature` field is the contract's own `AuthPayload` struct — `{signers: {Signer::Delegated(deployer): <bytes, unchecked for delegated signers>}, context_rule_ids: [0]}` (context rule `0` is the `Default` rule from `smart_account.initialize`, matching any context).
+2. A standard `Address` credentials entry for `deployer` (the registered `Signer::Delegated` wallet), authorizing the nested `deployer.require_auth_for_args((auth_digest,))` call that `authenticate()` makes on `smart_account`'s behalf, where `auth_digest = sha256(signature_payload || context_rule_ids.to_xdr())` — the digest the delegated signer actually has to sign, not the raw host-computed payload.
+
+Both entries were built directly against the XDR types (`stellar_sdk.xdr`/`stellar_sdk.scval` in Python — no `authorize_entry`-style helper exists for a custom account shape in any SDK, since the shape is contract-specific), submitted in a single transaction:
+
+```
+$ python3 scripts/bootstrap_intent_registry.py \
+    --smart-account CB4KZJ3I4XANE6GWPAMXCNXQ34PTQWPXVKFBBMLNKV25GAOXQC7RQUMS \
+    --intent-registry CDHTNPBXUMPCKUJ76HQ767MDRD4IVRRH4H5DOF4JUOO36QKSV4GXFRMR
+submitted: 2d63d6d16d4f9bf9ba34f3301b72cbff1e4ff44273a49f1bf899051063e683b2 SendTransactionStatus.PENDING
+status: GetTransactionStatus.SUCCESS
+intent_registry initialized. admin = CB4KZJ3I4XANE6GWPAMXCNXQ34PTQWPXVKFBBMLNKV25GAOXQC7RQUMS
+```
+
+[Explorer](https://stellar.expert/explorer/testnet/tx/2d63d6d16d4f9bf9ba34f3301b72cbff1e4ff44273a49f1bf899051063e683b2). Verified by re-invoking `initialize` afterward and getting `Error(Contract, #3000)` (`AlreadyInitialized`) — proof the first call actually succeeded rather than silently no-opping. This is a narrow, one-time substitute for the general wallet/SDK/relayer layer named in §7 — it only drives this single bootstrapping call, not arbitrary `smart_account` invocations.
+
+## 7. Known limitation: signer-gated interactive entrypoints
+
+Every entrypoint on `smart_account` that spends treasury funds — `execute_transfer_payment`, `execute_split_payment`, `create_scheduled_payment`, `cancel_scheduled_payment`, and the composed `ExecutionEntryPoint::execute` — calls `env.current_contract_address().require_auth()`. Because `smart_account` is a Soroban **custom account** (`CustomAccountInterface::__check_auth` delegating to `stellar_accounts::smart_account::do_check_auth`), satisfying that `require_auth()` requires a correctly-constructed `AuthPayload` (a `Map<Signer, Bytes>` of signer proofs plus the matched `context_rule_ids`) — not a plain Ed25519 transaction signature. Building that payload off-chain (matching the registered signer, whether an Ed25519 wallet key or a passkey) is exactly the job of a wallet/dApp/SDK client — the layer `docs/V1_SCOPE.md` explicitly lists under "Not Yet Included in V1." The `stellar` CLI has no built-in support for constructing third-party custom-account authorization schemes, so it cannot drive these entrypoints on its own.
 
 Two consequences for this deployment:
 
-1. **Everything gated by plain `Address::require_auth()` on a regular account is wired and demonstrated above** — `initialize()` calls (owner or admin auth), `set_adapter` (owner auth via `ownable::enforce_owner_auth`), `add_guardian` (admin auth), and all `policy_engine` configuration. None of these need the custom scheme, so the CLI signs them automatically.
-2. **`intent_registry` is deployed but not initialized.** Per the tested design (see `contracts/smart_account/src/test.rs`), `intent_registry`'s `admin` must be `smart_account` itself, so that `create_scheduled_payment`/`cancel_scheduled_payment` satisfy `ensure_admin` via Soroban's direct-caller exemption (a contract's own sub-invocation of another contract implicitly authorizes calls made *as* itself, with no separate signature). Setting that up requires calling `smart_account.execute(intent_registry, "initialize", [smart_account])`, which itself requires the treasury's own signer authorization — the same custom-account signing problem. Rather than initialize `intent_registry` with a different admin that would silently diverge from the tested design, it is left uninitialized and named here explicitly.
+1. **Everything gated by plain `Address::require_auth()` on a regular account is wired and demonstrated above** — `initialize()` calls (owner or admin auth), `propose_adapter_change` (owner auth via `ownable::enforce_owner_auth`), `add_guardian` (admin auth), and all `policy_engine` configuration. None of these need the custom scheme, so the CLI signs them automatically. `apply_adapter_change` is permissionless by design (see §5) once its delay elapses, so it doesn't need any authorization scheme at all.
+2. **`intent_registry`'s one-time bootstrap is not in this category** — see §6.3, where it's solved directly (a single, known call, worth hand-building once) rather than worked around. What remains out of reach of the bare CLI is the *interactive*, per-transaction case: signing an arbitrary, user-initiated `execute_transfer_payment`/`create_scheduled_payment` call, which needs a general-purpose signing client (§6.3's script is intentionally narrow — one hardcoded call, not a reusable library).
 
-The signer-gated flows themselves are proven correct — just not against this specific live deployment — by the 105-test local integration suite (`cargo test --workspace`), which exercises `execute_transfer_payment`, `execute_split_payment`, `create_scheduled_payment`/`cancel_scheduled_payment`, and `execute_scheduled_payment` end-to-end against real instances of every contract using `mock_all_auths()`, plus `webauthn_verifier`'s dedicated real-cryptography test suite (real secp256r1 and Ed25519 signatures) for the signature-verification layer itself.
+The interactive signer-gated flows themselves are proven correct — just not against this specific live deployment — by the 118-test local integration suite (`cargo test --workspace`), which exercises `execute_transfer_payment`, `execute_split_payment`, `create_scheduled_payment`/`cancel_scheduled_payment`, and `execute_scheduled_payment` end-to-end against real instances of every contract using `mock_all_auths()`, plus `webauthn_verifier`'s dedicated real-cryptography test suite (real secp256r1 and Ed25519 signatures) for the signature-verification layer itself.
 
 ## 8. Reproduction
 
@@ -117,7 +159,9 @@ The signer-gated flows themselves are proven correct — just not against this s
 ./scripts/deploy_testnet.sh
 ```
 
-Or step by step, see `scripts/deploy_testnet.sh` directly — every command in §4–§5 above is drawn verbatim from that script.
+Or step by step, see `scripts/deploy_testnet.sh` directly — every command in §4–§5 above is drawn verbatim from that script (except the token-address lookup fix below, done manually for this specific run before being folded back into the script).
+
+This run surfaced one real script bug, now fixed: since Stellar Asset Contract addresses are deterministic (derived from issuer + asset code), re-running the test-asset deploy step against a deployer that already has that asset deployed used to hard-fail with `Error(Storage, ExistingValue)` instead of reusing the existing contract. The script now catches that specific error and looks the existing address up via `stellar contract id asset` instead of failing the whole run.
 
 ## 9. Prior PoC Deployment
 

@@ -38,7 +38,7 @@
 
 use soroban_sdk::{
     auth::{Context, CustomAccountInterface},
-    contract, contractclient, contracterror, contractimpl, contracttype,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype,
     crypto::Hash,
     symbol_short, Address, BytesN, Env, Map, String, Symbol, Val, Vec,
 };
@@ -116,6 +116,90 @@ trait SplitAdapterInterface {
     fn execute_split(env: Env, token: Address, recipients: Vec<Address>, amounts: Vec<i128>);
 }
 
+/// A proposed adapter change awaiting its timelock. See
+/// `propose_adapter_change`/`apply_adapter_change` — added in response to
+/// an independent security review (`docs/SMART_CONTRACT_AUDIT_REPORT.md`
+/// finding 3) that an owner (or whoever compromised that key) could
+/// previously redirect execution routing immediately, with no delay for
+/// anyone to notice or react.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdapterChange {
+    pub adapter: Address,
+    pub effective_ledger: u32,
+}
+
+#[contractevent(topics = ["init"])]
+pub struct Initialized {
+    #[topic]
+    pub owner: Address,
+}
+
+#[contractevent(topics = ["adapterp"])]
+pub struct AdapterChangeProposed {
+    #[topic]
+    pub operation: Symbol,
+    pub adapter: Address,
+    pub effective_ledger: u32,
+}
+
+#[contractevent(topics = ["adaptrc"])]
+pub struct AdapterChangeCancelled {
+    #[topic]
+    pub operation: Symbol,
+}
+
+#[contractevent(topics = ["adapter"])]
+pub struct AdapterChanged {
+    #[topic]
+    pub operation: Symbol,
+    pub adapter: Address,
+}
+
+#[contractevent(topics = ["frozen"])]
+pub struct Frozen {
+    /// Distinguishes an owner-triggered `freeze()` from a guardian-pulled
+    /// `apply_guardian_freeze()` — both used to publish an identical,
+    /// data-free event, which made it impossible to tell which path
+    /// actually froze the account from the event log alone.
+    pub triggered_by_guardian: bool,
+}
+
+#[contractevent(topics = ["pay_ok"])]
+pub struct TransferPaid {
+    #[topic]
+    pub asset: Address,
+    #[topic]
+    pub destination: Address,
+    pub amount: i128,
+    pub nonce: u64,
+}
+
+#[contractevent(topics = ["splt_ok"])]
+pub struct SplitPaid {
+    #[topic]
+    pub asset: Address,
+    pub recipient_count: u32,
+    pub nonce: u64,
+}
+
+#[contractevent(topics = ["auto_ok"])]
+pub struct ScheduledPaymentExecuted {
+    #[topic]
+    pub intent_id: BytesN<32>,
+    pub child_sequence: u32,
+    pub asset: Address,
+    pub destination: Address,
+    pub amount: i128,
+}
+
+#[contractevent(topics = ["recover"])]
+pub struct RecoveryApplied {
+    #[topic]
+    pub request_id: BytesN<32>,
+    pub replacement_owner: Address,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DataKey {
@@ -125,6 +209,7 @@ enum DataKey {
     RecoveryManager,
     Frozen,
     Adapter(Symbol),
+    PendingAdapter(Symbol),
     UsedNonce(u64),
     AppliedRecovery(BytesN<32>),
 }
@@ -147,6 +232,8 @@ pub enum SmartAccountTreasuryError {
     Unauthorized = 8011,
     GuardianFreezeNotRequested = 8012,
     DuplicateRecipient = 8013,
+    NoPendingAdapterChange = 8014,
+    AdapterChangeDelayNotElapsed = 8015,
 }
 
 /// See `docs/TECHNICAL_ARCHITECTURE.md` §16 ("Production requirement").
@@ -159,10 +246,33 @@ const TTL_THRESHOLD_LEDGERS: u32 = TTL_EXTEND_TO_LEDGERS - 17280; // ~29 days
 const OP_TRANSFER: Symbol = symbol_short!("transfer");
 const OP_SPLIT: Symbol = symbol_short!("split");
 
+/// Delay between proposing and applying an adapter change — same ~1 day
+/// window `recovery_manager` uses for its own timelocks
+/// (`MIN_RECOVERY_DELAY_LEDGERS`, `GUARDIAN_ACTIVATION_DELAY_LEDGERS`), so a
+/// compromised owner reconfiguring where funds are routed cannot make that
+/// change take effect before anyone monitoring the account has a chance to
+/// notice and react (e.g. by pausing, or by having guardians freeze).
+const ADAPTER_CHANGE_DELAY_LEDGERS: u32 = 17280; // ~1 day
+
 #[contractimpl]
 impl SmartAccountTreasury {
     pub fn contract_name() -> Symbol {
         symbol_short!("sta_acct")
+    }
+
+    /// Permissionless TTL maintenance for this contract's instance storage
+    /// (which `PendingAdapter` lives in, among other instance-scoped
+    /// config) — extending TTL creates no authority, matching
+    /// `recovery_manager::extend_ttl`'s reasoning. Independent security
+    /// review finding: `propose_adapter_change` only bumps the instance TTL
+    /// once, at proposal time; a proposal left unapplied long enough after
+    /// its delay elapses, on an otherwise fully dormant treasury, could
+    /// archive before `apply_adapter_change` is ever called. This lets
+    /// anyone keep it alive without needing the owner to act.
+    pub fn extend_instance_ttl(env: Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
     }
 
     /// Bootstraps the treasury: sets the owner, seeds a `Default` context
@@ -207,7 +317,10 @@ impl SmartAccountTreasury {
             .instance()
             .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
 
-        env.events().publish((symbol_short!("init"),), owner);
+        Initialized {
+            owner: owner.clone(),
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -225,23 +338,114 @@ impl SmartAccountTreasury {
         env.storage().persistent().has(&DataKey::UsedNonce(nonce))
     }
 
-    /// Wires (or rewires) which adapter contract handles a given operation.
+    /// Proposes rewiring which adapter contract handles a given operation.
     /// Owner-gated. Unlike `policy_engine` / `intent_registry` /
     /// `recovery_manager` (pinned at `initialize`, see Architecture
     /// Decision in `docs/TECHNICAL_ARCHITECTURE.md` §6.9), adapters are
     /// mutable post-init because the doc explicitly scopes
     /// `set_adapter_config` as an owner-configurable entrypoint.
-    pub fn set_adapter(
+    ///
+    /// This does not take effect immediately — see `apply_adapter_change`.
+    /// An independent security review (`docs/SMART_CONTRACT_AUDIT_REPORT.md`
+    /// finding 3) noted that immediate, undelayed reconfiguration of
+    /// execution routing is a meaningful risk for a treasury contract
+    /// specifically (it decides *where funds go*, unlike e.g. `freeze`,
+    /// which only stops movement and is deliberately kept immediate).
+    /// Overwrites any existing pending proposal for the same operation —
+    /// the most recent proposal wins, matching how re-proposing normally
+    /// works elsewhere in this workspace (e.g. `policy_engine::set_asset_rule`).
+    ///
+    /// Explicitly extends the instance TTL on write. Review finding: this
+    /// contract's instance storage (which `PendingAdapter` lives in) shares
+    /// a single TTL across all of it, normally kept alive by `ensure_initialized`
+    /// running on the contract's regular traffic — but a proposal can be
+    /// made on an otherwise-dormant treasury, and the ~1 day timelock window
+    /// is short enough that "wait for some other call to refresh it" isn't a
+    /// safe assumption. Without this, a pending proposal on a quiet treasury
+    /// could archive before `apply_adapter_change` is ever called, silently
+    /// losing a legitimate governance action rather than just delaying it.
+    pub fn propose_adapter_change(
         env: Env,
         operation: Symbol,
         adapter: Address,
     ) -> Result<(), SmartAccountTreasuryError> {
         ownable::enforce_owner_auth(&env);
+        let effective_ledger = env
+            .ledger()
+            .sequence()
+            .checked_add(ADAPTER_CHANGE_DELAY_LEDGERS)
+            .ok_or(SmartAccountTreasuryError::NoPendingAdapterChange)?;
+        env.storage().instance().set(
+            &DataKey::PendingAdapter(operation.clone()),
+            &PendingAdapterChange {
+                adapter: adapter.clone(),
+                effective_ledger,
+            },
+        );
         env.storage()
             .instance()
-            .set(&DataKey::Adapter(operation.clone()), &adapter);
-        env.events()
-            .publish((symbol_short!("adapter"),), (operation, adapter));
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+        AdapterChangeProposed {
+            operation,
+            adapter,
+            effective_ledger,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Cancels a pending adapter change before it takes effect. Owner-gated,
+    /// mirroring `recovery_manager::cancel_recovery`'s pattern of letting
+    /// the legitimate owner walk back an erroneous or no-longer-wanted
+    /// proposal before its delay elapses.
+    pub fn cancel_adapter_change(
+        env: Env,
+        operation: Symbol,
+    ) -> Result<(), SmartAccountTreasuryError> {
+        ownable::enforce_owner_auth(&env);
+        let key = DataKey::PendingAdapter(operation.clone());
+        if !env.storage().instance().has(&key) {
+            return Err(SmartAccountTreasuryError::NoPendingAdapterChange);
+        }
+        env.storage().instance().remove(&key);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+        AdapterChangeCancelled { operation }.publish(&env);
+        Ok(())
+    }
+
+    /// Applies a pending adapter change once its delay has elapsed.
+    /// Permissionless, like `apply_recovery`/`apply_guardian_freeze`: the
+    /// authorization decision (the owner proposing this specific change)
+    /// already happened at `propose_adapter_change` time, so *when* an
+    /// already-authorized change actually lands needs no further gate to
+    /// be safe — it only needs the delay to have passed.
+    pub fn apply_adapter_change(
+        env: Env,
+        operation: Symbol,
+    ) -> Result<(), SmartAccountTreasuryError> {
+        let key = DataKey::PendingAdapter(operation.clone());
+        let pending: PendingAdapterChange = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(SmartAccountTreasuryError::NoPendingAdapterChange)?;
+        if env.ledger().sequence() < pending.effective_ledger {
+            return Err(SmartAccountTreasuryError::AdapterChangeDelayNotElapsed);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Adapter(operation.clone()), &pending.adapter);
+        env.storage().instance().remove(&key);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+        AdapterChanged {
+            operation,
+            adapter: pending.adapter,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -252,7 +456,10 @@ impl SmartAccountTreasury {
     pub fn freeze(env: Env) -> Result<(), SmartAccountTreasuryError> {
         ownable::enforce_owner_auth(&env);
         env.storage().instance().set(&DataKey::Frozen, &true);
-        env.events().publish((symbol_short!("frozen"),), ());
+        Frozen {
+            triggered_by_guardian: false,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -273,7 +480,10 @@ impl SmartAccountTreasury {
             return Err(SmartAccountTreasuryError::GuardianFreezeNotRequested);
         }
         env.storage().instance().set(&DataKey::Frozen, &true);
-        env.events().publish((symbol_short!("frozen"),), ());
+        Frozen {
+            triggered_by_guardian: true,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -309,10 +519,13 @@ impl SmartAccountTreasury {
         let adapter = adapter_address(&env, &OP_TRANSFER)?;
         TransferAdapterClient::new(&env, &adapter).execute_transfer(&asset, &destination, &amount);
 
-        env.events().publish(
-            (symbol_short!("pay_ok"),),
-            (asset, destination, amount, nonce),
-        );
+        TransferPaid {
+            asset,
+            destination,
+            amount,
+            nonce,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -373,10 +586,12 @@ impl SmartAccountTreasury {
         let adapter = adapter_address(&env, &OP_SPLIT)?;
         SplitAdapterClient::new(&env, &adapter).execute_split(&asset, &recipients, &amounts);
 
-        env.events().publish(
-            (symbol_short!("splt_ok"),),
-            (asset, recipients.len(), nonce),
-        );
+        SplitPaid {
+            asset,
+            recipient_count: recipients.len(),
+            nonce,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -388,12 +603,18 @@ impl SmartAccountTreasury {
     /// own address as its admin, so this nested call succeeds via
     /// sub-invocation tree membership rather than a second signature.
     ///
-    /// The caller-supplied `policy_version` on `intent` is ignored and
-    /// overwritten with `policy_engine`'s current version at the moment of
-    /// creation — the pinned version must reflect what was actually in
+    /// The caller-supplied `policy_version` and `adapter` on `intent` are
+    /// both ignored and overwritten: `policy_version` with `policy_engine`'s
+    /// current version, and `adapter` with the `transfer_adapter` currently
+    /// configured (via `propose_adapter_change`/`apply_adapter_change`).
+    /// Both must reflect what was actually in
     /// effect when the signer approved this schedule, not a value the
-    /// caller chose (see `execute_scheduled_payment` for why this pin
-    /// matters at execution time).
+    /// caller chose — otherwise a later adapter reconfiguration could
+    /// silently redirect an already-approved scheduled payment through a
+    /// different adapter at execution time (see `execute_scheduled_payment`
+    /// for why both pins matter there). Requiring `transfer_adapter` to
+    /// already be configured at creation time is deliberate: a schedule
+    /// should not be approvable before it's known how it will be paid.
     pub fn create_scheduled_payment(
         env: Env,
         mut intent: ScheduledIntentArgs,
@@ -403,6 +624,7 @@ impl SmartAccountTreasury {
 
         let policy_engine = policy_engine_address(&env)?;
         intent.policy_version = PolicyEngineClient::new(&env, &policy_engine).version();
+        intent.adapter = adapter_address(&env, &OP_TRANSFER)?;
 
         let intent_registry = intent_registry_address(&env)?;
         IntentRegistryClient::new(&env, &intent_registry).create_intent(&intent);
@@ -454,6 +676,19 @@ impl SmartAccountTreasury {
     /// All four values are now read back from the canonical `ScheduledIntent`
     /// record after `mark_child_executed` succeeds, so execution can only
     /// ever replay exactly what was approved at creation time.
+    ///
+    /// The adapter dispatched to is likewise the one pinned on the intent
+    /// at creation (`intent.adapter`), not whatever `transfer_adapter` is
+    /// currently configured. Resolving the adapter fresh
+    /// at execution time used to let a reconfiguration made any time
+    /// after approval — by the owner, or by whoever compromised that key —
+    /// silently redirect an already-approved payment through a different
+    /// execution path, breaking the "preauthorized exact action" guarantee
+    /// scheduled payments are supposed to have (see
+    /// `smart_account_pinned_adapter_survives_reconfiguration_after_approval`
+    /// in `test.rs`). If the adapter genuinely needs to change for an
+    /// existing schedule, cancel it and create a new one under the
+    /// currently configured adapter.
     pub fn execute_scheduled_payment(
         env: Env,
         intent_id: BytesN<32>,
@@ -475,23 +710,20 @@ impl SmartAccountTreasury {
             expected_version: intent.policy_version,
         });
 
-        let adapter = adapter_address(&env, &OP_TRANSFER)?;
-        TransferAdapterClient::new(&env, &adapter).execute_transfer(
+        TransferAdapterClient::new(&env, &intent.adapter).execute_transfer(
             &intent.asset,
             &intent.destination,
             &intent.amount,
         );
 
-        env.events().publish(
-            (symbol_short!("auto_ok"),),
-            (
-                intent_id,
-                child_sequence,
-                intent.asset,
-                intent.destination,
-                intent.amount,
-            ),
-        );
+        ScheduledPaymentExecuted {
+            intent_id,
+            child_sequence,
+            asset: intent.asset,
+            destination: intent.destination,
+            amount: intent.amount,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -539,10 +771,11 @@ impl SmartAccountTreasury {
         );
         env.storage().instance().set(&DataKey::Frozen, &false);
 
-        env.events().publish(
-            (symbol_short!("recover"),),
-            (request_id, request.replacement_owner.clone()),
-        );
+        RecoveryApplied {
+            request_id,
+            replacement_owner: request.replacement_owner.clone(),
+        }
+        .publish(&env);
         Ok(request.replacement_owner)
     }
 }
@@ -561,6 +794,7 @@ pub struct ScheduledIntentArgs {
     pub max_executions: u32,
     pub execution_count: u32,
     pub policy_version: u32,
+    pub adapter: Address,
     pub cancelled: bool,
 }
 

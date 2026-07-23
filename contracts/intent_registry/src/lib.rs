@@ -7,8 +7,8 @@
 //! for why this state does not live in SmartAccount itself.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address,
+    BytesN, Env, Symbol, Vec,
 };
 
 /// See `docs/TECHNICAL_ARCHITECTURE.md` §16 ("Production requirement":
@@ -43,7 +43,46 @@ pub struct ScheduledIntent {
     /// (see `docs/TECHNICAL_ARCHITECTURE.md` §13.2: "Policy version changes
     /// cannot silently mutate previously created automation semantics").
     pub policy_version: u32,
+    /// The `transfer_adapter` address configured on `smart_account` at the
+    /// moment this intent was approved, pinned here for the same reason
+    /// `policy_version` is: reconfiguring the adapter after approval (via
+    /// `smart_account::propose_adapter_change`/`apply_adapter_change`) must not silently redirect an
+    /// already-approved scheduled payment through a different execution
+    /// path. Execution reads this field back rather than resolving the
+    /// treasury's *current* adapter configuration.
+    pub adapter: Address,
     pub cancelled: bool,
+}
+
+#[contractevent(topics = ["init"])]
+pub struct Initialized {
+    #[topic]
+    pub admin: Address,
+}
+
+#[contractevent(topics = ["execset"])]
+pub struct ExecutorUpdated {
+    #[topic]
+    pub executor: Address,
+}
+
+#[contractevent(topics = ["intent"])]
+pub struct IntentCreated {
+    #[topic]
+    pub intent_id: BytesN<32>,
+}
+
+#[contractevent(topics = ["cancel"])]
+pub struct IntentCancelled {
+    #[topic]
+    pub intent_id: BytesN<32>,
+}
+
+#[contractevent(topics = ["exec"])]
+pub struct ChildExecuted {
+    #[topic]
+    pub intent_id: BytesN<32>,
+    pub child_sequence: u32,
 }
 
 #[contracttype]
@@ -92,7 +131,10 @@ impl IntentRegistry {
         bump_ttl(&env, &DataKey::Initialized);
         bump_ttl(&env, &DataKey::Admin);
         bump_ttl(&env, &DataKey::Executor);
-        env.events().publish((symbol_short!("init"),), admin);
+        Initialized {
+            admin: admin.clone(),
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -102,7 +144,10 @@ impl IntentRegistry {
             .persistent()
             .set(&DataKey::Executor, &executor);
         bump_ttl(&env, &DataKey::Executor);
-        env.events().publish((symbol_short!("execset"),), executor);
+        ExecutorUpdated {
+            executor: executor.clone(),
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -149,13 +194,16 @@ impl IntentRegistry {
             max_executions: intent.max_executions,
             execution_count: 0,
             policy_version: intent.policy_version,
+            adapter: intent.adapter,
             cancelled: false,
         };
 
         env.storage().persistent().set(&key, &stored_intent);
         bump_ttl(&env, &key);
-        env.events()
-            .publish((symbol_short!("intent"),), intent.intent_id);
+        IntentCreated {
+            intent_id: intent.intent_id,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -185,7 +233,10 @@ impl IntentRegistry {
         intent.cancelled = true;
         env.storage().persistent().set(&key, &intent);
         bump_ttl(&env, &key);
-        env.events().publish((symbol_short!("cancel"),), intent_id);
+        IntentCancelled {
+            intent_id: intent_id.clone(),
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -231,8 +282,11 @@ impl IntentRegistry {
         env.storage().persistent().set(&child_key, &true);
         bump_ttl(&env, &key);
         bump_ttl(&env, &child_key);
-        env.events()
-            .publish((symbol_short!("exec"),), (intent_id, child_sequence));
+        ChildExecuted {
+            intent_id: intent_id.clone(),
+            child_sequence,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -327,6 +381,7 @@ mod tests {
             max_executions: 3,
             execution_count: 0,
             policy_version: 1,
+            adapter: Address::generate(env),
             cancelled: false,
         }
     }

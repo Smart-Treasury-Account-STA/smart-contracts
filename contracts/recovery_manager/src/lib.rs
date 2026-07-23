@@ -29,8 +29,8 @@
 //! were cast is honored, not silently grandfathered in.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address,
+    BytesN, Env, Symbol, Vec,
 };
 
 const MAX_APPROVERS: u32 = 20;
@@ -57,6 +57,17 @@ const MIN_RECOVERY_DELAY_LEDGERS: u32 = 17280;
 /// oversight — see `docs/V1_SCOPE.md`.
 const GUARDIAN_ACTIVATION_DELAY_LEDGERS: u32 = 17280;
 
+/// Delay between proposing and applying a guardian removal or a guardian
+/// threshold change. Independent security review finding
+/// (`docs/SMART_CONTRACT_AUDIT_REPORT.md`): `remove_guardian` and
+/// `set_guardian_threshold` used to take effect immediately under
+/// single-admin control — a compromised admin could dismantle or weaken
+/// the guardian set (removing legitimate guardians, or lowering the
+/// threshold) with no delay for anyone to notice and react. Mirrors the
+/// existing ~1 day delay pattern already used for recovery/guardian
+/// activation above.
+const GUARDIAN_CHANGE_DELAY_LEDGERS: u32 = 17280;
+
 /// See `docs/TECHNICAL_ARCHITECTURE.md` §16 ("Production requirement").
 /// Guardian records and pending recovery plans are exactly the kind of
 /// long-dormant, security-critical state §16 calls out by name — they may
@@ -78,13 +89,104 @@ pub struct RecoveryRequest {
     pub finalized: bool,
 }
 
+/// A proposed guardian threshold change awaiting its timelock. See
+/// `propose_threshold_change`/`apply_threshold_change`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingThresholdChange {
+    pub new_threshold: u32,
+    pub effective_ledger: u32,
+}
+
+#[contractevent(topics = ["init"])]
+pub struct Initialized {
+    #[topic]
+    pub admin: Address,
+    pub guardian_threshold: u32,
+}
+
+#[contractevent(topics = ["threshp"])]
+pub struct ThresholdChangeProposed {
+    pub new_threshold: u32,
+    pub effective_ledger: u32,
+}
+
+#[contractevent(topics = ["threshc"])]
+pub struct ThresholdChangeCancelled {}
+
+#[contractevent(topics = ["thresh"])]
+pub struct ThresholdChanged {
+    pub new_threshold: u32,
+}
+
+#[contractevent(topics = ["guard"])]
+pub struct GuardianAdded {
+    #[topic]
+    pub guardian: Address,
+    pub activates_at: u32,
+}
+
+#[contractevent(topics = ["unguardp"])]
+pub struct GuardianRemovalProposed {
+    #[topic]
+    pub guardian: Address,
+    pub effective_ledger: u32,
+}
+
+#[contractevent(topics = ["unguardc"])]
+pub struct GuardianRemovalCancelled {
+    #[topic]
+    pub guardian: Address,
+}
+
+#[contractevent(topics = ["unguard"])]
+pub struct GuardianRemoved {
+    #[topic]
+    pub guardian: Address,
+}
+
+#[contractevent(topics = ["gfreeze"])]
+pub struct GuardianFreezeRequested {
+    #[topic]
+    pub guardian: Address,
+}
+
+#[contractevent(topics = ["open"])]
+pub struct RecoveryOpened {
+    #[topic]
+    pub request_id: BytesN<32>,
+}
+
+#[contractevent(topics = ["appr"])]
+pub struct RecoveryApproved {
+    #[topic]
+    pub request_id: BytesN<32>,
+    #[topic]
+    pub guardian: Address,
+}
+
+#[contractevent(topics = ["cancel"])]
+pub struct RecoveryCancelled {
+    #[topic]
+    pub request_id: BytesN<32>,
+}
+
+#[contractevent(topics = ["final"])]
+pub struct RecoveryFinalized {
+    #[topic]
+    pub request_id: BytesN<32>,
+    pub replacement_owner: Address,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DataKey {
     Initialized,
     Admin,
     GuardianThreshold,
+    PendingGuardianThreshold,
     Guardian(Address),
+    PendingGuardianRemoval(Address),
     Request(BytesN<32>),
     GuardianFreezeRequested,
 }
@@ -109,6 +211,9 @@ pub enum RecoveryManagerError {
     DelayTooShort = 4013,
     GuardianNotYetActive = 4014,
     Unauthorized = 4015,
+    NoPendingGuardianRemoval = 4016,
+    NoPendingThresholdChange = 4017,
+    GuardianChangeDelayNotElapsed = 4018,
 }
 
 #[contractimpl]
@@ -138,30 +243,43 @@ impl RecoveryManager {
         bump_ttl(&env, &DataKey::Initialized);
         bump_ttl(&env, &DataKey::Admin);
         bump_ttl(&env, &DataKey::GuardianThreshold);
-        env.events()
-            .publish((symbol_short!("init"),), (admin, guardian_threshold));
+        Initialized {
+            admin: admin.clone(),
+            guardian_threshold,
+        }
+        .publish(&env);
         Ok(())
     }
 
     /// Permissionless TTL maintenance for named, already-existing guardians
-    /// and requests — extending TTL creates no authority (§16.1).
+    /// and requests — extending TTL creates no authority (§16.1). Also
+    /// covers any pending threshold change and any pending removal for the
+    /// given guardians: those are only bumped otherwise at `propose_*` time,
+    /// so a proposal left unapplied long enough after its delay elapses
+    /// could archive before `apply_*` is ever called, silently losing an
+    /// already-authorized governance action rather than just delaying it
+    /// (independent security review finding). `bump_ttl` no-ops on keys
+    /// that don't exist, so calling this with no pending changes is safe.
     pub fn extend_ttl(env: Env, guardians: Vec<Address>, request_ids: Vec<BytesN<32>>) {
         bump_ttl(&env, &DataKey::Initialized);
         bump_ttl(&env, &DataKey::Admin);
         bump_ttl(&env, &DataKey::GuardianThreshold);
+        bump_ttl(&env, &DataKey::PendingGuardianThreshold);
         for guardian in guardians.iter() {
-            bump_ttl(&env, &DataKey::Guardian(guardian));
+            bump_ttl(&env, &DataKey::Guardian(guardian.clone()));
+            bump_ttl(&env, &DataKey::PendingGuardianRemoval(guardian));
         }
         for request_id in request_ids.iter() {
             bump_ttl(&env, &DataKey::Request(request_id));
         }
     }
 
-    /// Updates the guardian threshold. Takes effect immediately for any
-    /// request not yet finalized: `finalize_recovery` always reads the
-    /// threshold fresh rather than the value in effect when the request was
-    /// opened or approved.
-    pub fn set_guardian_threshold(
+    /// Proposes a new guardian threshold. Does not take effect immediately
+    /// — see `apply_threshold_change`. Once applied, it takes
+    /// effect for any request not yet finalized: `finalize_recovery` always
+    /// reads the threshold fresh rather than the value in effect when the
+    /// request was opened or approved.
+    pub fn propose_threshold_change(
         env: Env,
         new_threshold: u32,
     ) -> Result<(), RecoveryManagerError> {
@@ -169,20 +287,74 @@ impl RecoveryManager {
         if new_threshold == 0 {
             return Err(RecoveryManagerError::InvalidThreshold);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::GuardianThreshold, &new_threshold);
-        bump_ttl(&env, &DataKey::GuardianThreshold);
-        env.events()
-            .publish((symbol_short!("thresh"),), new_threshold);
+        let effective_ledger = env
+            .ledger()
+            .sequence()
+            .checked_add(GUARDIAN_CHANGE_DELAY_LEDGERS)
+            .ok_or(RecoveryManagerError::InvalidThreshold)?;
+        let key = DataKey::PendingGuardianThreshold;
+        env.storage().persistent().set(
+            &key,
+            &PendingThresholdChange {
+                new_threshold,
+                effective_ledger,
+            },
+        );
+        bump_ttl(&env, &key);
+        ThresholdChangeProposed {
+            new_threshold,
+            effective_ledger,
+        }
+        .publish(&env);
         Ok(())
     }
 
-    /// Registers a guardian. The guardian is recorded immediately (`is_guardian`
-    /// reflects it right away, and `remove_guardian` can revoke it right
-    /// away), but its approval does not count toward any threshold until
-    /// `GUARDIAN_ACTIVATION_DELAY_LEDGERS` have passed — see the constant's
-    /// doc comment for why.
+    /// Cancels a pending guardian threshold change before it takes effect.
+    /// Admin-gated, letting a legitimate admin walk back an erroneous or
+    /// no-longer-wanted proposal before its delay elapses.
+    pub fn cancel_threshold_change(env: Env) -> Result<(), RecoveryManagerError> {
+        ensure_admin(&env)?;
+        let key = DataKey::PendingGuardianThreshold;
+        if !env.storage().persistent().has(&key) {
+            return Err(RecoveryManagerError::NoPendingThresholdChange);
+        }
+        env.storage().persistent().remove(&key);
+        ThresholdChangeCancelled {}.publish(&env);
+        Ok(())
+    }
+
+    /// Applies a pending guardian threshold change once its delay has
+    /// elapsed. Permissionless: the authorization decision (the admin
+    /// proposing this specific change) already happened, so *when* an
+    /// already-authorized change lands needs no further gate.
+    pub fn apply_threshold_change(env: Env) -> Result<(), RecoveryManagerError> {
+        let key = DataKey::PendingGuardianThreshold;
+        let pending: PendingThresholdChange = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(RecoveryManagerError::NoPendingThresholdChange)?;
+        if env.ledger().sequence() < pending.effective_ledger {
+            return Err(RecoveryManagerError::GuardianChangeDelayNotElapsed);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::GuardianThreshold, &pending.new_threshold);
+        env.storage().persistent().remove(&key);
+        bump_ttl(&env, &DataKey::GuardianThreshold);
+        ThresholdChanged {
+            new_threshold: pending.new_threshold,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Registers a guardian. The guardian is recorded immediately
+    /// (`is_guardian` reflects it right away), but its approval does not
+    /// count toward any threshold until `GUARDIAN_ACTIVATION_DELAY_LEDGERS`
+    /// have passed — see the constant's doc comment for why. Removing a
+    /// guardian, unlike adding one, is itself timelocked — see
+    /// `propose_remove_guardian`.
     pub fn add_guardian(env: Env, guardian: Address) -> Result<(), RecoveryManagerError> {
         ensure_admin(&env)?;
         let key = DataKey::Guardian(guardian.clone());
@@ -197,26 +369,97 @@ impl RecoveryManager {
             .ok_or(RecoveryManagerError::GuardianAlreadyExists)?;
         env.storage().persistent().set(&key, &activates_at);
         bump_ttl(&env, &key);
-        env.events()
-            .publish((symbol_short!("guard"),), (guardian, activates_at));
+        GuardianAdded {
+            guardian: guardian.clone(),
+            activates_at,
+        }
+        .publish(&env);
         Ok(())
     }
 
-    /// Removes a guardian. Does not touch any open request's stored
-    /// `approvers` list — that history is preserved as an audit trail — but
-    /// the removed guardian's past approval stops counting toward
-    /// `live_approval_count` / `finalize_recovery` from this point on,
-    /// because both recompute against current guardian registration rather
-    /// than trusting the historical approval.
-    pub fn remove_guardian(env: Env, guardian: Address) -> Result<(), RecoveryManagerError> {
+    /// Proposes removing a guardian. Does not take effect immediately —
+    /// see `apply_guardian_removal`. The guardian remains fully active
+    /// (still counted by `is_guardian`, `live_approval_count`, and able to
+    /// approve requests or request a freeze) until the proposal is applied.
+    /// Independent security review finding: immediate removal under
+    /// single-admin control meant a compromised admin could dismantle the
+    /// guardian set with no delay for anyone to notice.
+    pub fn propose_remove_guardian(
+        env: Env,
+        guardian: Address,
+    ) -> Result<(), RecoveryManagerError> {
         ensure_admin(&env)?;
-        let key = DataKey::Guardian(guardian.clone());
-        if !env.storage().persistent().has(&key) {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Guardian(guardian.clone()))
+        {
             return Err(RecoveryManagerError::GuardianNotFound);
         }
+        let effective_ledger = env
+            .ledger()
+            .sequence()
+            .checked_add(GUARDIAN_CHANGE_DELAY_LEDGERS)
+            .ok_or(RecoveryManagerError::GuardianNotFound)?;
+        let key = DataKey::PendingGuardianRemoval(guardian.clone());
+        env.storage().persistent().set(&key, &effective_ledger);
+        bump_ttl(&env, &key);
+        GuardianRemovalProposed {
+            guardian: guardian.clone(),
+            effective_ledger,
+        }
+        .publish(&env);
+        Ok(())
+    }
 
+    /// Cancels a pending guardian removal before it takes effect.
+    /// Admin-gated, letting a legitimate admin walk back an erroneous or
+    /// no-longer-wanted proposal before its delay elapses.
+    pub fn cancel_guardian_removal(
+        env: Env,
+        guardian: Address,
+    ) -> Result<(), RecoveryManagerError> {
+        ensure_admin(&env)?;
+        let key = DataKey::PendingGuardianRemoval(guardian.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(RecoveryManagerError::NoPendingGuardianRemoval);
+        }
         env.storage().persistent().remove(&key);
-        env.events().publish((symbol_short!("unguard"),), guardian);
+        GuardianRemovalCancelled {
+            guardian: guardian.clone(),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Applies a pending guardian removal once its delay has elapsed.
+    /// Permissionless: the authorization decision (the admin proposing this
+    /// specific removal) already happened, so *when* an already-authorized
+    /// removal lands needs no further gate. Does not touch any open
+    /// request's stored `approvers` list — that history is preserved as an
+    /// audit trail — but the removed guardian's past approval stops
+    /// counting toward `live_approval_count` / `finalize_recovery` from
+    /// this point on, because both recompute against current guardian
+    /// registration rather than trusting the historical approval.
+    pub fn apply_guardian_removal(env: Env, guardian: Address) -> Result<(), RecoveryManagerError> {
+        let pending_key = DataKey::PendingGuardianRemoval(guardian.clone());
+        let effective_ledger: u32 = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .ok_or(RecoveryManagerError::NoPendingGuardianRemoval)?;
+        if env.ledger().sequence() < effective_ledger {
+            return Err(RecoveryManagerError::GuardianChangeDelayNotElapsed);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Guardian(guardian.clone()));
+        env.storage().persistent().remove(&pending_key);
+        GuardianRemoved {
+            guardian: guardian.clone(),
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -249,7 +492,10 @@ impl RecoveryManager {
             .persistent()
             .set(&DataKey::GuardianFreezeRequested, &true);
         bump_ttl(&env, &DataKey::GuardianFreezeRequested);
-        env.events().publish((symbol_short!("gfreeze"),), guardian);
+        GuardianFreezeRequested {
+            guardian: guardian.clone(),
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -312,7 +558,10 @@ impl RecoveryManager {
         };
         env.storage().persistent().set(&key, &request);
         bump_ttl(&env, &key);
-        env.events().publish((symbol_short!("open"),), request_id);
+        RecoveryOpened {
+            request_id: request_id.clone(),
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -350,8 +599,11 @@ impl RecoveryManager {
         request.approvers.push_back(guardian.clone());
         env.storage().persistent().set(&key, &request);
         bump_ttl(&env, &key);
-        env.events()
-            .publish((symbol_short!("appr"),), (request_id, guardian));
+        RecoveryApproved {
+            request_id: request_id.clone(),
+            guardian: guardian.clone(),
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -368,7 +620,10 @@ impl RecoveryManager {
         request.cancelled = true;
         env.storage().persistent().set(&key, &request);
         bump_ttl(&env, &key);
-        env.events().publish((symbol_short!("cancel"),), request_id);
+        RecoveryCancelled {
+            request_id: request_id.clone(),
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -412,10 +667,11 @@ impl RecoveryManager {
         request.finalized = true;
         env.storage().persistent().set(&key, &request);
         bump_ttl(&env, &key);
-        env.events().publish(
-            (symbol_short!("final"),),
-            (request_id, request.replacement_owner.clone()),
-        );
+        RecoveryFinalized {
+            request_id: request_id.clone(),
+            replacement_owner: request.replacement_owner.clone(),
+        }
+        .publish(&env);
         Ok(request.replacement_owner)
     }
 
@@ -615,17 +871,128 @@ mod tests {
         let guardian = Address::generate(&env);
 
         client.add_guardian(&guardian);
-        client.remove_guardian(&guardian);
+        client.propose_remove_guardian(&guardian);
+        set_ledger(&env, GUARDIAN_CHANGE_DELAY_LEDGERS);
+        client.apply_guardian_removal(&guardian);
 
-        client.open_recovery(&admin, &request_id, &Address::generate(&env), &17280);
+        client.open_recovery(
+            &admin,
+            &request_id,
+            &Address::generate(&env),
+            &(GUARDIAN_CHANGE_DELAY_LEDGERS * 2),
+        );
         let revoked = client.try_approve_recovery(&request_id, &guardian);
         assert_eq!(revoked, Err(Ok(RecoveryManagerError::GuardianNotFound)));
 
-        let double_removal = client.try_remove_guardian(&guardian);
+        let double_removal = client.try_propose_remove_guardian(&guardian);
         assert_eq!(
             double_removal,
             Err(Ok(RecoveryManagerError::GuardianNotFound))
         );
+    }
+
+    /// Independent security review finding (`docs/SMART_CONTRACT_AUDIT_REPORT.md`):
+    /// guardian removal used to take effect immediately under single-admin
+    /// control. This proves the timelock is real, not just present in the
+    /// happy path — applying before the delay has elapsed is rejected, and
+    /// the guardian remains registered.
+    #[test]
+    fn guardian_removal_cannot_be_applied_before_the_delay_elapses() {
+        let (env, client, _admin) = setup();
+        let guardian = Address::generate(&env);
+        client.add_guardian(&guardian);
+        client.propose_remove_guardian(&guardian);
+
+        let too_early = client.try_apply_guardian_removal(&guardian);
+        assert_eq!(
+            too_early,
+            Err(Ok(RecoveryManagerError::GuardianChangeDelayNotElapsed))
+        );
+        assert!(client.is_guardian(&guardian));
+    }
+
+    /// The legitimate admin can walk back an erroneous or no-longer-wanted
+    /// removal proposal before it takes effect — mirrors
+    /// `cancel_recovery`'s existing pattern for open recovery requests.
+    #[test]
+    fn guardian_removal_can_be_cancelled_before_it_takes_effect() {
+        let (env, client, _admin) = setup();
+        let guardian = Address::generate(&env);
+        client.add_guardian(&guardian);
+        client.propose_remove_guardian(&guardian);
+        client.cancel_guardian_removal(&guardian);
+
+        set_ledger(&env, GUARDIAN_CHANGE_DELAY_LEDGERS);
+        let no_pending = client.try_apply_guardian_removal(&guardian);
+        assert_eq!(
+            no_pending,
+            Err(Ok(RecoveryManagerError::NoPendingGuardianRemoval))
+        );
+        assert!(client.is_guardian(&guardian));
+    }
+
+    #[test]
+    fn cancel_guardian_removal_rejects_when_nothing_is_pending() {
+        let (env, client, _admin) = setup();
+        let guardian = Address::generate(&env);
+        let err = client.try_cancel_guardian_removal(&guardian);
+        assert_eq!(err, Err(Ok(RecoveryManagerError::NoPendingGuardianRemoval)));
+    }
+
+    /// Same two properties as the guardian-removal timelock, for the
+    /// threshold-change timelock: too-early application is rejected, and a
+    /// cancelled proposal cannot later be applied.
+    #[test]
+    fn threshold_change_cannot_be_applied_before_the_delay_elapses() {
+        let (_env, client, _admin) = setup();
+        client.propose_threshold_change(&3);
+
+        let too_early = client.try_apply_threshold_change();
+        assert_eq!(
+            too_early,
+            Err(Ok(RecoveryManagerError::GuardianChangeDelayNotElapsed))
+        );
+    }
+
+    #[test]
+    fn threshold_change_can_be_cancelled_before_it_takes_effect() {
+        let (env, client, _admin) = setup();
+        client.propose_threshold_change(&3);
+        client.cancel_threshold_change();
+
+        set_ledger(&env, GUARDIAN_CHANGE_DELAY_LEDGERS);
+        let no_pending = client.try_apply_threshold_change();
+        assert_eq!(
+            no_pending,
+            Err(Ok(RecoveryManagerError::NoPendingThresholdChange))
+        );
+    }
+
+    #[test]
+    fn cancel_threshold_change_rejects_when_nothing_is_pending() {
+        let (_env, client, _admin) = setup();
+        let err = client.try_cancel_threshold_change();
+        assert_eq!(err, Err(Ok(RecoveryManagerError::NoPendingThresholdChange)));
+    }
+
+    /// The authorization decision already happened at proposal time (an
+    /// admin-gated call); applying an already-authorized, delay-elapsed
+    /// change is deliberately permissionless — same pattern as
+    /// `apply_recovery`/`apply_guardian_freeze` in `smart_account`. Proven
+    /// here with zero mocked or real authorization at all.
+    #[test]
+    fn applying_guardian_removal_and_threshold_change_needs_no_authorization() {
+        let (env, client, _admin) = setup();
+        let guardian = Address::generate(&env);
+        client.add_guardian(&guardian);
+        client.propose_remove_guardian(&guardian);
+        client.propose_threshold_change(&1);
+
+        set_ledger(&env, GUARDIAN_CHANGE_DELAY_LEDGERS);
+        env.set_auths(&[]);
+        client.apply_guardian_removal(&guardian);
+        client.apply_threshold_change();
+        assert!(!client.is_guardian(&guardian));
     }
 
     #[test]
@@ -683,8 +1050,16 @@ mod tests {
         client.approve_recovery(&request_id, &guardian_b);
         assert_eq!(client.live_approval_count(&request_id), 2);
 
-        // guardian_a's device is compromised; admin removes them.
-        client.remove_guardian(&guardian_a);
+        // guardian_a's device is compromised; admin proposes removal — this
+        // does not take effect immediately (independent security review
+        // finding; see `docs/SMART_CONTRACT_AUDIT_REPORT.md`), so the
+        // approval still counts until the delay elapses and the removal is
+        // actually applied.
+        client.propose_remove_guardian(&guardian_a);
+        assert_eq!(client.live_approval_count(&request_id), 2);
+
+        set_ledger(&env, 17280 + GUARDIAN_CHANGE_DELAY_LEDGERS);
+        client.apply_guardian_removal(&guardian_a);
         assert_eq!(client.live_approval_count(&request_id), 1);
 
         let err = client.try_finalize_recovery(&request_id);
@@ -694,7 +1069,10 @@ mod tests {
         // once past its own activation delay.
         let guardian_c = Address::generate(&env);
         client.add_guardian(&guardian_c);
-        set_ledger(&env, 17280 + GUARDIAN_ACTIVATION_DELAY_LEDGERS);
+        set_ledger(
+            &env,
+            17280 + GUARDIAN_CHANGE_DELAY_LEDGERS + GUARDIAN_ACTIVATION_DELAY_LEDGERS,
+        );
         client.approve_recovery(&request_id, &guardian_c);
         assert_eq!(client.live_approval_count(&request_id), 2);
         assert!(client.try_finalize_recovery(&request_id).is_ok());
@@ -719,8 +1097,11 @@ mod tests {
         client.approve_recovery(&request_id, &guardian_b);
 
         // Threshold was 2 at open time and both guardians approved — would
-        // have finalized. Admin raises it to 3 before anyone finalizes.
-        client.set_guardian_threshold(&3);
+        // have finalized. Admin proposes raising it to 3, and the delay
+        // elapses, before anyone finalizes.
+        client.propose_threshold_change(&3);
+        set_ledger(&env, 17280 + GUARDIAN_CHANGE_DELAY_LEDGERS);
+        client.apply_threshold_change();
 
         let err = client.try_finalize_recovery(&request_id);
         assert_eq!(err, Err(Ok(RecoveryManagerError::BelowThreshold)));
@@ -867,6 +1248,46 @@ mod tests {
         assert!(refreshed_request_ttl >= TTL_THRESHOLD_LEDGERS);
     }
 
+    /// Independent security review finding: a pending threshold change or
+    /// guardian removal is only TTL-bumped once, at `propose_*` time. Left
+    /// unapplied long enough after its delay elapses, it could archive
+    /// before `apply_*` is ever called. `extend_ttl` must keep both alive
+    /// too, not just guardians/requests.
+    #[test]
+    fn pending_governance_changes_are_refreshed_by_permissionless_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(RecoveryManager, ());
+        let client = RecoveryManagerClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &1);
+
+        let guardian = Address::generate(&env);
+        client.add_guardian(&guardian);
+        client.propose_threshold_change(&2);
+        client.propose_remove_guardian(&guardian);
+
+        set_ledger(&env, TTL_THRESHOLD_LEDGERS / 2);
+        env.set_auths(&[]);
+        client.extend_ttl(
+            &soroban_sdk::vec![&env, guardian.clone()],
+            &soroban_sdk::vec![&env],
+        );
+
+        let threshold_ttl = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::PendingGuardianThreshold)
+        });
+        let removal_ttl = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::PendingGuardianRemoval(guardian))
+        });
+        assert!(threshold_ttl >= TTL_THRESHOLD_LEDGERS);
+        assert!(removal_ttl >= TTL_THRESHOLD_LEDGERS);
+    }
+
     #[test]
     fn contract_name_reports_expected_symbol() {
         assert_eq!(RecoveryManager::contract_name(), symbol_short!("sta_rec"));
@@ -902,9 +1323,9 @@ mod tests {
     }
 
     #[test]
-    fn set_guardian_threshold_rejects_zero() {
+    fn propose_threshold_change_rejects_zero() {
         let (_env, client, _admin) = setup();
-        let err = client.try_set_guardian_threshold(&0);
+        let err = client.try_propose_threshold_change(&0);
         assert_eq!(err, Err(Ok(RecoveryManagerError::InvalidThreshold)));
     }
 
@@ -926,7 +1347,15 @@ mod tests {
         assert!(!client.is_guardian(&guardian));
         client.add_guardian(&guardian);
         assert!(client.is_guardian(&guardian));
-        client.remove_guardian(&guardian);
+
+        client.propose_remove_guardian(&guardian);
+        // Proposing removal does not take effect immediately — the
+        // guardian remains fully registered until the delay elapses and
+        // the removal is actually applied.
+        assert!(client.is_guardian(&guardian));
+
+        set_ledger(&env, GUARDIAN_CHANGE_DELAY_LEDGERS);
+        client.apply_guardian_removal(&guardian);
         assert!(!client.is_guardian(&guardian));
     }
 

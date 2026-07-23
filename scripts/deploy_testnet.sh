@@ -17,8 +17,16 @@
 # owner/admin authorization (`Address::require_auth()` on a regular Stellar
 # account), which the CLI signs automatically. See the "Known limitation"
 # section of `docs/TESTNET_DEPLOYMENT.md` for detail and for how the
-# signer-gated flows are proven instead (105 local integration tests using
+# signer-gated flows are proven instead (local integration tests using
 # `mock_all_auths()`, plus `webauthn_verifier`'s real-cryptography fixtures).
+#
+# Adapter wiring is a two-step, real-time-delayed process (independent
+# security review finding — see `docs/SMART_CONTRACT_AUDIT_REPORT.md` and
+# `docs/V1_SCOPE.md` §6): `propose_adapter_change` takes effect only after
+# ~1 day (17280 ledgers) has actually elapsed on testnet, so this script
+# proposes the change and prints the follow-up `apply_adapter_change`
+# commands to run once that real delay has passed — it cannot apply them
+# itself within a single run.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -82,18 +90,29 @@ stellar contract invoke --id "$SMART_ACCOUNT" --source "$DEPLOYER" --network "$N
   --intent_registry "$INTENT_REGISTRY" \
   --recovery_manager "$RECOVERY_MANAGER"
 
-echo "== Wiring adapters into smart_account (owner-gated, not signer-gated) =="
+echo "== Proposing adapter wiring into smart_account (owner-gated, not signer-gated; takes ~1 day to apply) =="
 stellar contract invoke --id "$SMART_ACCOUNT" --source "$DEPLOYER" --network "$NETWORK" -- \
-  set_adapter --operation transfer --adapter "$TRANSFER_ADAPTER"
+  propose_adapter_change --operation transfer --adapter "$TRANSFER_ADAPTER"
 stellar contract invoke --id "$SMART_ACCOUNT" --source "$DEPLOYER" --network "$NETWORK" -- \
-  set_adapter --operation split --adapter "$SPLIT_ADAPTER"
+  propose_adapter_change --operation split --adapter "$SPLIT_ADAPTER"
 
 echo "== Registering a guardian =="
 stellar contract invoke --id "$RECOVERY_MANAGER" --source "$DEPLOYER" --network "$NETWORK" -- \
   add_guardian --guardian "$GUARDIAN_ADDR"
 
 echo "== Deploying a test SAC asset and minting to smart_account =="
-TOKEN=$(stellar contract asset deploy --asset "$ASSET_CODE:$DEPLOYER" --source "$DEPLOYER" --network "$NETWORK" | tail -1)
+# SAC addresses are deterministic (derived from issuer + asset code), so
+# re-running this script with the same DEPLOYER/ASSET_CODE hits "contract
+# already exists" on a second run rather than actually failing — look the
+# existing contract ID up instead of tolerating a hard error either way.
+if TOKEN=$(stellar contract asset deploy --asset "$ASSET_CODE:$DEPLOYER" --source "$DEPLOYER" --network "$NETWORK" 2>/tmp/asset_deploy_err.log | tail -1) && [ -n "$TOKEN" ]; then
+  :
+elif grep -q "already exists" /tmp/asset_deploy_err.log; then
+  TOKEN=$(stellar contract id asset --asset "$ASSET_CODE:$DEPLOYER" --network "$NETWORK")
+else
+  cat /tmp/asset_deploy_err.log >&2
+  exit 1
+fi
 echo "token=$TOKEN"
 stellar contract invoke --id "$TOKEN" --source "$DEPLOYER" --network "$NETWORK" -- \
   mint --to "$SMART_ACCOUNT" --amount 1000000000
@@ -120,6 +139,18 @@ stellar contract invoke --id "$POLICY_ENGINE" --source "$DEPLOYER" --network "$N
 set -e
 
 echo "== Done. Record the printed contract IDs in docs/TESTNET_DEPLOYMENT.md. =="
-echo "NOTE: intent_registry is deployed but deliberately left uninitialized here"
-echo "— see docs/TESTNET_DEPLOYMENT.md for why (requires a signer-authorized"
-echo "execute() dispatch through smart_account, i.e. an off-chain SDK client)."
+echo "NOTE: intent_registry is deployed but not yet initialized here — its"
+echo "admin must be smart_account itself, which requires smart_account's own"
+echo "custom-account authorization (not a plain CLI signature). Bootstrap it"
+echo "separately with:"
+echo "  python3 scripts/bootstrap_intent_registry.py \\"
+echo "    --smart-account $SMART_ACCOUNT --intent-registry $INTENT_REGISTRY"
+echo "See docs/TESTNET_DEPLOYMENT.md §6.3 for what that script does and why."
+echo
+echo "NOTE: the adapter wiring proposed above does not take effect until"
+echo "~1 day (17280 ledgers) has actually passed on testnet. Once it has,"
+echo "run:"
+echo "  stellar contract invoke --id $SMART_ACCOUNT --source $DEPLOYER --network $NETWORK -- \\"
+echo "    apply_adapter_change --operation transfer"
+echo "  stellar contract invoke --id $SMART_ACCOUNT --source $DEPLOYER --network $NETWORK -- \\"
+echo "    apply_adapter_change --operation split"
