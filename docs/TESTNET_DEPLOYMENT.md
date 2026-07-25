@@ -82,12 +82,14 @@ Each deployment has two transactions: WASM upload, then contract instance creati
 
 Every event above was emitted via the new `#[contractevent]` structs (not the old raw-tuple `Events::publish` calls) — confirmed directly from the CLI's event-decoding output during this deployment, e.g. `Initialized (init), admin: "...", guardian_threshold: 1` for `recovery_manager`, matching the typed struct fields rather than an untyped tuple.
 
-The two `propose_adapter_change` calls do not take effect until their effective ledger is reached (~1 day). Once past ledger `3768351`/`3768353` respectively, run:
+The two `propose_adapter_change` calls took effect once their timelock elapsed (2026-07-25, ledger `3795561` — past both `3768351`/`3768353`). Applied with:
 
-```bash
-stellar contract invoke --id CB4KZJ3I4XANE6GWPAMXCNXQ34PTQWPXVKFBBMLNKV25GAOXQC7RQUMS --source sta-testnet-deployer --network testnet -- apply_adapter_change --operation transfer
-stellar contract invoke --id CB4KZJ3I4XANE6GWPAMXCNXQ34PTQWPXVKFBBMLNKV25GAOXQC7RQUMS --source sta-testnet-deployer --network testnet -- apply_adapter_change --operation split
-```
+| Step | Transaction | Result |
+|---|---|---|
+| `smart_account.apply_adapter_change(transfer)` | [`6257c3a5...`](https://stellar.expert/explorer/testnet/tx/6257c3a52127c70747603d32efe5ba71dbf54b5f341627982327b5a488151333) | `AdapterChanged(operation: "transfer", adapter: "CAX766XY...")` — permissionless, no auth required |
+| `smart_account.apply_adapter_change(split)` | [`732ac748...`](https://stellar.expert/explorer/testnet/tx/732ac748be8e32bd86e1506456b7601d4e07dc63038aacb78ee6078797e6b3d4) | `AdapterChanged(operation: "split", adapter: "CAFTFU2E...")` |
+
+Both adapters are now genuinely wired into `smart_account` — see §6.4 for a real payment executed through this exact path.
 
 `intent_registry` was initially deployed uninitialized, then bootstrapped separately (admin = `smart_account`) — see §6.3 and [§7](#7-known-limitation-signer-gated-interactive-entrypoints).
 
@@ -142,6 +144,46 @@ intent_registry initialized. admin = CB4KZJ3I4XANE6GWPAMXCNXQ34PTQWPXVKFBBMLNKV2
 
 [Explorer](https://stellar.expert/explorer/testnet/tx/2d63d6d16d4f9bf9ba34f3301b72cbff1e4ff44273a49f1bf899051063e683b2). Verified by re-invoking `initialize` afterward and getting `Error(Contract, #3000)` (`AlreadyInitialized`) — proof the first call actually succeeded rather than silently no-opping. This is a narrow, one-time substitute for the general wallet/SDK/relayer layer named in §7 — it only drives this single bootstrapping call, not arbitrary `smart_account` invocations.
 
+### 6.4 A real signer-authorized SAC payment, executed on-chain
+
+Everything in §6.1 exercised `policy_engine.validate_policy` directly — permissionless, no signer authorization involved. This section goes one step further: a real `smart_account.execute_transfer_payment` call, authorized by the treasury's actual registered signer, moving real (testnet) `STA` balance out of the treasury through `transfer_adapter`.
+
+This needed two pieces of one-time setup beyond what §5 already did:
+
+| Step | Transaction | Result |
+|---|---|---|
+| Fund `sta-testnet-recipient` (friendbot) | — | Recipient account created on testnet (it never existed on-ledger before this) |
+| Recipient establishes an `STA` trustline | [`9fdf9442...`](https://stellar.expert/explorer/testnet/tx/9fdf9442950c86a8ed17a3eabc60eeabc15bbe1fb50dfebf91b377eaed40466e) | Classic `change_trust` — required before any SAC can hold a balance on this account |
+
+With both adapters applied (§6, above) and the recipient able to hold `STA`, `scripts/execute_demo_transfer_payment.py` hand-built the same kind of custom `smart_account` authorization used in §6.3, extended to cover this call's real invocation tree:
+
+```
+$ python3 scripts/execute_demo_transfer_payment.py \
+    --smart-account CB4KZJ3I4XANE6GWPAMXCNXQ34PTQWPXVKFBBMLNKV25GAOXQC7RQUMS \
+    --asset CCOUVA654JH2V6B7LNTKHJP5DF3QA553RS2IIWXSGPDFH2N3QILIVU5L \
+    --destination GAK3XILRBYBMBOCZMSLL2CLR6WPQLEIOC6ZCYYPTE4OIAX3PCFFO2YMU \
+    --amount 5000000 \
+    --nonce 1 \
+    --expected-policy-version 1
+submitted: f712d5609ca52226746ad9b6776240b763d597246808df1c2a844bf1905d8131 SendTransactionStatus.PENDING
+status: GetTransactionStatus.SUCCESS
+execute_transfer_payment succeeded. tx = f712d5609ca52226746ad9b6776240b763d597246808df1c2a844bf1905d8131
+```
+
+[Explorer](https://stellar.expert/explorer/testnet/tx/f712d5609ca52226746ad9b6776240b763d597246808df1c2a844bf1905d8131). Events emitted, in order: `policy_engine`'s `PolicyValidated (pol_ok)`, the SAC's own `transfer` event, `transfer_adapter`'s `TransferExecuted (xfer)`, and `smart_account`'s `TransferPaid (pay_ok)` — the full call chain, not a shortcut.
+
+One real mechanical finding from building this: `smart_account.execute_transfer_payment`'s own `require_auth()` is not the only place `smart_account` needs to authorize in this call graph. `transfer_adapter::execute_transfer` independently calls `smart_account.require_auth()` again — satisfied automatically by Soroban's invoker-contract shortcut, since `smart_account` is `transfer_adapter`'s *direct* caller, so it needs no declared tree node at all. But the Stellar Asset Contract's own `transfer(from, to, amount)` *also* calls `from.require_auth()` internally, and `transfer_adapter` (not `smart_account`) is the SAC's direct caller — so that one does *not* get the invoker shortcut, and had to be declared as a direct child of the root invocation in the `AuthPayload`'s authorized tree (confirmed empirically: nesting it under an intermediate `transfer_adapter` node, mirroring the naive call graph, fails with `Error(Auth, InvalidAction)`; declaring it as a sibling of the root's direct children succeeds). `scripts/execute_demo_transfer_payment.py`'s comments document this exactly.
+
+Verified state change directly, not just a successful status code:
+
+| | Before | After |
+|---|---|---|
+| Recipient `STA` balance | `0` (no trustline) | `5000000` |
+| Treasury `STA` balance | `1000000000` | `995000000` |
+| `smart_account.is_nonce_used(1)` | `false` | `true` |
+
+This closes the remaining gap from earlier in this document: an actual signer-authorized payment, not only the permissionless policy check, now has a live, real, reproducible testnet transaction behind it.
+
 ## 7. Known limitation: signer-gated interactive entrypoints
 
 Every entrypoint on `smart_account` that spends treasury funds — `execute_transfer_payment`, `execute_split_payment`, `create_scheduled_payment`, `cancel_scheduled_payment`, and the composed `ExecutionEntryPoint::execute` — calls `env.current_contract_address().require_auth()`. Because `smart_account` is a Soroban **custom account** (`CustomAccountInterface::__check_auth` delegating to `stellar_accounts::smart_account::do_check_auth`), satisfying that `require_auth()` requires a correctly-constructed `AuthPayload` (a `Map<Signer, Bytes>` of signer proofs plus the matched `context_rule_ids`) — not a plain Ed25519 transaction signature. Building that payload off-chain (matching the registered signer, whether an Ed25519 wallet key or a passkey) is exactly the job of a wallet/dApp/SDK client — the layer `docs/V1_SCOPE.md` explicitly lists under "Not Yet Included in V1." The `stellar` CLI has no built-in support for constructing third-party custom-account authorization schemes, so it cannot drive these entrypoints on its own.
@@ -149,9 +191,9 @@ Every entrypoint on `smart_account` that spends treasury funds — `execute_tran
 Two consequences for this deployment:
 
 1. **Everything gated by plain `Address::require_auth()` on a regular account is wired and demonstrated above** — `initialize()` calls (owner or admin auth), `propose_adapter_change` (owner auth via `ownable::enforce_owner_auth`), `add_guardian` (admin auth), and all `policy_engine` configuration. None of these need the custom scheme, so the CLI signs them automatically. `apply_adapter_change` is permissionless by design (see §5) once its delay elapses, so it doesn't need any authorization scheme at all.
-2. **`intent_registry`'s one-time bootstrap is not in this category** — see §6.3, where it's solved directly (a single, known call, worth hand-building once) rather than worked around. What remains out of reach of the bare CLI is the *interactive*, per-transaction case: signing an arbitrary, user-initiated `execute_transfer_payment`/`create_scheduled_payment` call, which needs a general-purpose signing client (§6.3's script is intentionally narrow — one hardcoded call, not a reusable library).
+2. **`intent_registry`'s one-time bootstrap (§6.3) and one real `execute_transfer_payment` call (§6.4) are both solved directly** — hand-built, one-off custom-account authorizations, not the bare CLI. What remains genuinely out of reach of the bare CLI is a *general-purpose, reusable* signing capability: an arbitrary user picking an arbitrary destination/amount/schedule through a wallet UI, with the dApp constructing the right `AuthPayload` on demand for whatever call that turns out to be. §6.3's and §6.4's scripts are each intentionally narrow — one hardcoded call shape apiece, not a library — see `docs/DAPP_INTEGRATION_SPEC.md` for what a general client actually needs to do.
 
-The interactive signer-gated flows themselves are proven correct — just not against this specific live deployment — by the 118-test local integration suite (`cargo test --workspace`), which exercises `execute_transfer_payment`, `execute_split_payment`, `create_scheduled_payment`/`cancel_scheduled_payment`, and `execute_scheduled_payment` end-to-end against real instances of every contract using `mock_all_auths()`, plus `webauthn_verifier`'s dedicated real-cryptography test suite (real secp256r1 and Ed25519 signatures) for the signature-verification layer itself.
+Beyond the one concretely executed transfer in §6.4, the interactive signer-gated flows are proven correct across every contract and edge case by the 120-test local integration suite (`cargo test --workspace`), which exercises `execute_transfer_payment`, `execute_split_payment`, `create_scheduled_payment`/`cancel_scheduled_payment`, and `execute_scheduled_payment` end-to-end against real instances of every contract using `mock_all_auths()`, plus `webauthn_verifier`'s dedicated real-cryptography test suite (real secp256r1 and Ed25519 signatures) for the signature-verification layer itself.
 
 ## 8. Reproduction
 

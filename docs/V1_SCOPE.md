@@ -139,7 +139,7 @@ Four treasury contracts plus a shared verifier, all in `contracts/`:
 cargo test --workspace
 ```
 
-Expected: 118 tests pass across 7 packages, zero failures. This includes real cryptographic fixtures (`webauthn_verifier`) and real Stellar Asset Contract transfers (`transfer_adapter`, `split_adapter`, and the full `smart_account` integration suite, which wires real instances of every subordinate contract rather than mocking them).
+Expected: 120 tests pass across 7 packages, zero failures. This includes real cryptographic fixtures (`webauthn_verifier`) and real Stellar Asset Contract transfers (`transfer_adapter`, `split_adapter`, and the full `smart_account` integration suite, which wires real instances of every subordinate contract rather than mocking them).
 
 ```bash
 cargo llvm-cov --workspace --summary-only

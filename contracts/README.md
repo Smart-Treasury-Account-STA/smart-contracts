@@ -34,7 +34,7 @@ Run from the repository root:
 cargo test --workspace
 ```
 
-118 tests across all 7 packages. Measure coverage with:
+120 tests across all 7 packages. Measure coverage with:
 
 ```bash
 cargo llvm-cov --workspace --summary-only

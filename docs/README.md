@@ -11,6 +11,7 @@ This folder documents the current **V1 implementation** in `contracts/`. Everyth
 5. **[`TESTNET_DEPLOYMENT.md`](TESTNET_DEPLOYMENT.md)** — live V1 deployment record on Stellar testnet: real contract addresses, transactions, and one explicitly named limitation on what a bare CLI deployment can and can't exercise.
 6. **[`SMART_CONTRACT_AUDIT_REPORT.md`](SMART_CONTRACT_AUDIT_REPORT.md)** — an independently produced review of the workspace. All three findings were confirmed against the actual code and fixed; `V1_SCOPE.md` §6 records the verdict and fix for each — read that section alongside this file, not instead of it.
 7. **[`GOVERNANCE_MULTISIG_DESIGN.md`](GOVERNANCE_MULTISIG_DESIGN.md)** — design notes (not implemented) for distributing the admin/owner role itself across multiple keys, the one item from the review above left as a named V1 boundary rather than fixed.
+8. **[`DAPP_INTEGRATION_SPEC.md`](DAPP_INTEGRATION_SPEC.md)** — how a client (the Tranche 2 dApp and scheduled-payment relayer) connects to these deployed contracts: wallet integration, reading treasury state, and — the one genuinely nonstandard piece — constructing `smart_account`'s custom authorization payload for payments and scheduled-payment creation.
 
 ## Not part of the current review
 
@@ -25,3 +26,4 @@ This folder documents the current **V1 implementation** in `contracts/`. Everyth
 | "Which contract implements module X?" | `SMART_CONTRACT_SPECIFICATION.md` §1.1 |
 | "Is this deployed anywhere I can check independently?" | `TESTNET_DEPLOYMENT.md` |
 | "What's deliberately not built yet, and why?" | `V1_SCOPE.md` → Not Yet Included in V1 |
+| "How does the dApp/relayer actually connect to these contracts?" | `DAPP_INTEGRATION_SPEC.md` |

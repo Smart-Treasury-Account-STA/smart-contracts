@@ -49,7 +49,7 @@ Key technical areas, and where each is enforced:
 cargo test --workspace
 ```
 
-Expected: 118 tests pass, 0 failures, across `sta-webauthn-verifier` (9), `sta-policy-engine` (12), `sta-intent-registry` (14), `sta-recovery-manager` (34), `sta-transfer-adapter` (5), `sta-split-adapter` (8), `sta-smart-account` (36).
+Expected: 120 tests pass, 0 failures, across `sta-webauthn-verifier` (9), `sta-policy-engine` (12), `sta-intent-registry` (14), `sta-recovery-manager` (35), `sta-transfer-adapter` (5), `sta-split-adapter` (8), `sta-smart-account` (37).
 
 ```bash
 cargo llvm-cov --workspace --summary-only
