@@ -19,12 +19,13 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test
         run: cargo test --workspace
-      - name: install libdbus (stellar-cli's `keyring` dep needs it on Linux)
-        # `keyring` (used by stellar-cli for OS credential storage) pulls in
-        # `libdbus-sys` on Linux, which needs `dbus-1.pc` via pkg-config.
-        # `ubuntu-latest` doesn't ship libdbus-1-dev by default, so the build
-        # fails with "The system library `dbus-1` ... was not found."
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: install stellar-cli's native Linux build deps
+        # `keyring` (OS credential storage) needs `libdbus-sys` -> `dbus-1.pc`.
+        # `stellar-ledger` (hardware-wallet support) needs `hidapi` ->
+        # `libudev.pc`. Neither ships on `ubuntu-latest` by default, so the
+        # build fails with "The system library `dbus-1`/`libudev` ... was
+        # not found." macOS needs neither (Keychain/IOKit cover both natively).
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config
       - name: install stellar CLI
         # Plain `cargo build --target wasm32v1-none` doesn't work here: the
         # workspace opts into soroban-sdk's `experimental_spec_shaking_v2`
