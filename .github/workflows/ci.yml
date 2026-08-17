@@ -25,6 +25,16 @@ jobs:
         # feature, which is only supported through `stellar contract build`
         # (stellar-cli 25.2.0+) — the same tool `scripts/deploy_testnet.sh`
         # uses, so this step exercises the real build path, not a proxy for it.
-        run: cargo install --locked stellar-cli --version 26.0.0
+        #
+        # stellar-cli 26.0.0's published Cargo.lock pins `ethnum 1.5.2`,
+        # whose `TryFromIntError` zero-sized-transmute fallback breaks on
+        # Rust >=1.97 (rust-lang/rust#157363). Fixed upstream in ethnum
+        # 1.5.3, but `--locked` means we can't pick that up ourselves here.
+        # Build stellar-cli with a pinned pre-regression toolchain so this
+        # keeps working regardless of which Rust `stable` resolves to for
+        # the rest of this job.
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          cargo +1.96.0 install --locked stellar-cli --version 26.0.0
       - name: stellar contract build
         run: stellar contract build --optimize --out-dir wasm
