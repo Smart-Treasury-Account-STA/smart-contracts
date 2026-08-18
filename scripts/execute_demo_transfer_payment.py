@@ -101,6 +101,7 @@ def build_auth_entries(
     destination: str,
     amount: int,
     expiration_ledger: int,
+    context_rule_id: int = 0,
 ) -> list[stellar_xdr.SorobanAuthorizationEntry]:
     deployer_addr = deployer_kp.public_key
 
@@ -137,9 +138,13 @@ def build_auth_entries(
 
     # Two auth contexts reach __check_auth: the root call and the SAC
     # transfer (the adapter's own requirement is invoker-satisfied and
-    # never becomes an auth context at all) -- both validated against rule
-    # 0, the founding Default rule.
-    context_rule_ids_scval = scval.to_vec([scval.to_uint32(0), scval.to_uint32(0)])
+    # never becomes an auth context at all) -- both validated against the
+    # same context rule (the founding Default rule 0 by default; any other
+    # Default-typed rule the signer is registered under also works, since
+    # ContextRuleType::Default matches any Contract-context call).
+    context_rule_ids_scval = scval.to_vec(
+        [scval.to_uint32(context_rule_id), scval.to_uint32(context_rule_id)]
+    )
     context_rule_ids_xdr = context_rule_ids_scval.to_xdr_bytes()
     auth_digest = hashlib.sha256(sig_payload + context_rule_ids_xdr).digest()
 
@@ -196,6 +201,12 @@ def main() -> int:
     parser.add_argument("--nonce", type=int, required=True)
     parser.add_argument("--expected-policy-version", type=int, required=True)
     parser.add_argument("--deployer-identity", default="sta-testnet-deployer")
+    parser.add_argument(
+        "--context-rule-id",
+        type=int,
+        default=0,
+        help="Context rule the signer identity is registered under (default 0, the founding rule).",
+    )
     args = parser.parse_args()
 
     deployer_secret = stellar_secret(args.deployer_identity)
@@ -221,6 +232,7 @@ def main() -> int:
         args.destination,
         args.amount,
         expiration_ledger,
+        args.context_rule_id,
     )
 
     source_account = server.load_account(deployer_kp.public_key)
