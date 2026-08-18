@@ -251,9 +251,9 @@ def main() -> int:
     while True:
         time.sleep(3)
         result = server.get_transaction(send_resp.hash)
-        if result.status != "NOT_FOUND":
+        if result.status.name != "NOT_FOUND":
             print("status:", result.status)
-            if result.status != "SUCCESS":
+            if result.status.name != "SUCCESS":
                 print(result)
                 return 1
             print("execute_transfer_payment succeeded. tx =", send_resp.hash)

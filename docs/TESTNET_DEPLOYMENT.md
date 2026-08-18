@@ -184,6 +184,19 @@ Verified state change directly, not just a successful status code:
 
 This closes the remaining gap from earlier in this document: an actual signer-authorized payment, not only the permissionless policy check, now has a live, real, reproducible testnet transaction behind it.
 
+### 6.5 Nonce replay and policy-version pinning, rejected live
+
+§6.4's real payment consumed `nonce = 1` under `expected_policy_version = 1`. Two follow-up calls, otherwise identical and fully signer-authorized (same real `AuthPayload` construction, same registered signer — the rejection is *not* an auth failure), were built and sent to `simulateTransaction` against the live deployment to prove the two guarantees Tranche 1 only had local-test coverage for actually hold on a public ledger:
+
+| Call | Result |
+|---|---|
+| Same call, `nonce = 1` again (already consumed by §6.4) | ❌ Rejected: `Error(Contract, #8005)` (`NonceAlreadyUsed`) |
+| A fresh `nonce = 555`, but `expected_policy_version = 99` (stale/wrong — actual version is `1`) | ❌ Rejected: `Error(Contract, #2006)` (`VersionMismatch`) |
+
+Both were caught at the `simulateTransaction` stage — the same real signer authorization used for §6.4 was supplied, so the host actually executed `smart_account`'s full `execute_transfer_payment` logic (`__check_auth` succeeds, then `consume_nonce`/`policy_engine.validate_policy` reject) rather than failing earlier for an unrelated reason. As with §6.1's checks, a rejected simulation has no transaction hash to link — nothing is submitted to the network for a call that fails before it would mutate state.
+
+This is the concrete evidence Tranche 2 Deliverable 1 asks for specifically: policy-version pinning and nonce-based replay protection enforced against live testnet state, on the exact call path a real wallet-approved payment uses — not simulated in isolation, and not merely asserted from the local test suite.
+
 ## 7. Known limitation: signer-gated interactive entrypoints
 
 Every entrypoint on `smart_account` that spends treasury funds — `execute_transfer_payment`, `execute_split_payment`, `create_scheduled_payment`, `cancel_scheduled_payment`, and the composed `ExecutionEntryPoint::execute` — calls `env.current_contract_address().require_auth()`. Because `smart_account` is a Soroban **custom account** (`CustomAccountInterface::__check_auth` delegating to `stellar_accounts::smart_account::do_check_auth`), satisfying that `require_auth()` requires a correctly-constructed `AuthPayload` (a `Map<Signer, Bytes>` of signer proofs plus the matched `context_rule_ids`) — not a plain Ed25519 transaction signature. Building that payload off-chain (matching the registered signer, whether an Ed25519 wallet key or a passkey) is exactly the job of a wallet/dApp/SDK client — the layer `docs/V1_SCOPE.md` explicitly lists under "Not Yet Included in V1." The `stellar` CLI has no built-in support for constructing third-party custom-account authorization schemes, so it cannot drive these entrypoints on its own.
