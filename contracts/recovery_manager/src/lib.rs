@@ -506,6 +506,33 @@ impl RecoveryManager {
             .unwrap_or(false)
     }
 
+    /// Security review finding: `guardian_freeze_requested` alone is a
+    /// read-only check against a flag that, before this function existed,
+    /// was set once by `request_guardian_freeze` and never cleared —
+    /// meaning `smart_account::apply_guardian_freeze` (deliberately
+    /// permissionless, matching `apply_recovery`'s "pull an
+    /// already-authorized fact" pattern) could be called again at any
+    /// point in the future, by anyone, and would keep succeeding, even
+    /// long after the original incident was fully resolved through a
+    /// completed recovery. `apply_recovery` already guards against this
+    /// exact class of problem with a request-keyed `AppliedRecovery`
+    /// replay guard; this flag had no equivalent. Consuming it atomically
+    /// here — check and clear in one call, not a separate read then a
+    /// separate write — closes the same gap for guardian-triggered freeze
+    /// that `AppliedRecovery` already closes for recovery finalization,
+    /// and avoids a TOCTOU window between checking and clearing.
+    /// Permissionless, like the read it replaces for this purpose:
+    /// clearing an already-consumed authorization creates no new
+    /// authority.
+    pub fn consume_guardian_freeze_request(env: Env) -> bool {
+        let key = DataKey::GuardianFreezeRequested;
+        let requested = env.storage().persistent().get(&key).unwrap_or(false);
+        if requested {
+            env.storage().persistent().remove(&key);
+        }
+        requested
+    }
+
     /// Opens a recovery request. Callable by `admin`/owner **or by any
     /// currently-active guardian** — this is a deliberate fix, not the
     /// original design: requiring the admin's own authorization to open a
@@ -1471,6 +1498,34 @@ mod tests {
         assert!(!client.guardian_freeze_requested());
         client.request_guardian_freeze(&guardian);
         assert!(client.guardian_freeze_requested());
+    }
+
+    /// Security review finding: `guardian_freeze_requested` alone never
+    /// cleared the flag it read, so a caller relying only on that getter
+    /// (as `smart_account::apply_guardian_freeze` used to) could act on an
+    /// already-stale request indefinitely. `consume_guardian_freeze_request`
+    /// must check and clear atomically: true exactly once, false after
+    /// that, with no separate request in between.
+    #[test]
+    fn consume_guardian_freeze_request_clears_it_exactly_once() {
+        let (env, client, _admin) = setup();
+        let guardian = Address::generate(&env);
+        client.add_guardian(&guardian);
+        set_ledger(&env, GUARDIAN_ACTIVATION_DELAY_LEDGERS);
+        client.request_guardian_freeze(&guardian);
+
+        assert!(client.consume_guardian_freeze_request());
+        assert!(!client.guardian_freeze_requested());
+        assert!(!client.consume_guardian_freeze_request());
+    }
+
+    /// Consuming with nothing pending is a safe no-op, not an error --
+    /// mirrors `guardian_freeze_requested()`'s own `unwrap_or(false)`
+    /// default rather than panicking on absent state.
+    #[test]
+    fn consume_guardian_freeze_request_with_nothing_pending_returns_false() {
+        let (_env, client, _admin) = setup();
+        assert!(!client.consume_guardian_freeze_request());
     }
 
     #[test]

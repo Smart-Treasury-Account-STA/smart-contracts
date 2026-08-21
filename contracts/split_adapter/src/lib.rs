@@ -55,6 +55,19 @@ impl SplitAdapter {
         symbol_short!("sta_splt")
     }
 
+    /// Security review finding: same gap as `transfer_adapter`'s identical
+    /// entrypoint -- this contract's instance TTL was only ever extended
+    /// as a side effect of `execute_split` succeeding, which itself
+    /// requires the treasury's own authorization. A fully dormant
+    /// treasury (no split payments at all for ~30 days -- plausible, e.g.
+    /// a treasury that only ever does single-recipient transfers) had no
+    /// permissionless way to keep this adapter's instance storage alive.
+    pub fn extend_instance_ttl(env: Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+    }
+
     pub fn initialize(
         env: Env,
         admin: Address,

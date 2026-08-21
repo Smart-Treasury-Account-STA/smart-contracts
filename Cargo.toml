@@ -7,6 +7,8 @@ members = [
     "contracts/recovery_manager",
     "contracts/transfer_adapter",
     "contracts/split_adapter",
+    "contracts/threshold_policy",
+    "contracts/governance_account",
 ]
 resolver = "2"
 

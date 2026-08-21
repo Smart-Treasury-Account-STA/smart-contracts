@@ -136,5 +136,16 @@ fn contract_name_reports_expected_symbol() {
     );
 }
 
+/// Security review finding: same gap as `transfer_adapter`'s identical
+/// entrypoint -- no permissionless way to keep instance TTL alive
+/// independent of `execute_split` succeeding.
+#[test]
+fn extend_instance_ttl_is_permissionless() {
+    let e = Env::default();
+    let (client, _admin, _smart_account) = setup(&e);
+    e.set_auths(&[]);
+    client.extend_instance_ttl();
+}
+
 #[allow(dead_code)]
 fn assert_error_type(_: SplitAdapterError) {}

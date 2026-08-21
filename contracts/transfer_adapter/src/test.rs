@@ -81,6 +81,17 @@ fn execute_transfer_without_smart_account_authorization_fails() {
     client.execute_transfer(&token, &recipient, &100);
 }
 
+/// Security review finding: this contract had no permissionless way to
+/// keep its own instance TTL alive independent of `execute_transfer`
+/// succeeding (which itself needs the treasury's real authorization).
+#[test]
+fn extend_instance_ttl_is_permissionless() {
+    let e = Env::default();
+    let (client, _admin, _smart_account) = setup(&e);
+    e.set_auths(&[]);
+    client.extend_instance_ttl();
+}
+
 #[test]
 fn contract_name_reports_expected_symbol() {
     let e = Env::default();

@@ -1026,6 +1026,31 @@ fn apply_guardian_freeze_without_a_request_is_rejected() {
     h.smart_account.apply_guardian_freeze();
 }
 
+/// Security review finding: `apply_guardian_freeze` used to read a flag in
+/// `recovery_manager` that was set once and never cleared -- meaning a
+/// stale, long-resolved freeze request could be replayed by anyone,
+/// indefinitely, including after a full recovery had already restored
+/// normal operation. This proves the fix: a second call, with no new
+/// `request_guardian_freeze` in between, is rejected exactly like the
+/// "never requested" case above -- the original request is consumed
+/// exactly once, matching `apply_recovery`'s own replay guard.
+#[test]
+#[should_panic(expected = "Error(Contract, #8012)")]
+fn apply_guardian_freeze_cannot_replay_an_already_consumed_request() {
+    let h = setup();
+    let guardian = addr(&h.env);
+    h.recovery_manager.add_guardian(&guardian);
+    h.env.ledger().with_mut(|l| l.sequence_number = 17280);
+
+    h.recovery_manager.request_guardian_freeze(&guardian);
+    h.smart_account.apply_guardian_freeze();
+    assert!(h.smart_account.status().frozen);
+
+    // No new request_guardian_freeze call -- this must fail, not silently
+    // re-freeze off the same stale flag.
+    h.smart_account.apply_guardian_freeze();
+}
+
 /// Real gap this session found: `docs/TECHNICAL_ARCHITECTURE.md` §12.6
 /// documents SmartAccount as validating "duplicate destinations" for a
 /// split — a repeated recipient in the same split call must be rejected

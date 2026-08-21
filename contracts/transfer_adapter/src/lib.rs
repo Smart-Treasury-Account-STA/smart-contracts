@@ -62,6 +62,26 @@ impl TransferAdapter {
         symbol_short!("sta_xfer")
     }
 
+    /// Security review finding: this contract's instance TTL was only ever
+    /// extended as a side effect of `execute_transfer` succeeding, which
+    /// itself requires the treasury's own authorization -- meaning a
+    /// treasury that goes fully dormant (no payments at all, entirely
+    /// plausible for e.g. a quarterly-disbursement treasury) had no way
+    /// for *anyone* to keep this adapter's instance storage alive, since
+    /// the one call that touches it can't be driven permissionlessly.
+    /// Instance storage archival is not a soft failure -- an archived
+    /// contract cannot be invoked at all without a separate restore
+    /// operation. Every other contract in this workspace
+    /// (`smart_account`, `recovery_manager`, `policy_engine`,
+    /// `intent_registry`, `governance_account`) already has a
+    /// permissionless maintenance entrypoint for exactly this reason;
+    /// this one and `split_adapter` were the two gaps.
+    pub fn extend_instance_ttl(env: Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+    }
+
     /// Binds this adapter instance to exactly one treasury `SmartAccount`.
     /// An adapter instance is not shared across unrelated treasuries: doing
     /// so would let one treasury's approved transfer authorize funds moving

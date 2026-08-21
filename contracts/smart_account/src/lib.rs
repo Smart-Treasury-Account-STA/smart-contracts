@@ -84,7 +84,7 @@ pub struct RecoveryRequestView {
 #[allow(unused)]
 trait RecoveryManagerInterface {
     fn request_status(env: Env, request_id: BytesN<32>) -> RecoveryRequestView;
-    fn guardian_freeze_requested(env: Env) -> bool;
+    fn consume_guardian_freeze_request(env: Env) -> bool;
 }
 
 #[contractclient(name = "PolicyEngineClient")]
@@ -473,10 +473,24 @@ impl SmartAccountTreasury {
     /// `apply_recovery` pulls a finalized request: permissionlessly, on
     /// this contract's own terms, with `recovery_manager` carrying no
     /// knowledge of or dependency on this treasury.
+    ///
+    /// Security review finding: this used to call `recovery_manager`'s
+    /// read-only `guardian_freeze_requested`, which checks a flag that is
+    /// set once and, without this fix, never cleared. Since this
+    /// entrypoint is deliberately permissionless (matching
+    /// `apply_recovery`'s "pull an already-authorized fact" pattern), that
+    /// meant anyone could re-freeze the treasury at any future point —
+    /// even long after a full recovery had resolved the original
+    /// incident — simply because a stale flag from months earlier was
+    /// still sitting in `recovery_manager`'s storage. `apply_recovery`
+    /// already guards against exactly this class of problem with a
+    /// request-keyed `AppliedRecovery` replay guard; this now gets the
+    /// same guarantee by calling `consume_guardian_freeze_request`
+    /// (check-and-clear in one call) instead of the passive read.
     pub fn apply_guardian_freeze(env: Env) -> Result<(), SmartAccountTreasuryError> {
         ensure_initialized(&env)?;
         let recovery_manager = recovery_manager_address(&env)?;
-        if !RecoveryManagerClient::new(&env, &recovery_manager).guardian_freeze_requested() {
+        if !RecoveryManagerClient::new(&env, &recovery_manager).consume_guardian_freeze_request() {
             return Err(SmartAccountTreasuryError::GuardianFreezeNotRequested);
         }
         env.storage().instance().set(&DataKey::Frozen, &true);
