@@ -127,19 +127,19 @@ impl PolicyEngine {
     }
 
     pub fn initialize(env: Env, admin: Address) -> Result<(), PolicyEngineError> {
-        if env.storage().persistent().has(&DataKey::Initialized) {
+        if env.storage().instance().has(&DataKey::Initialized) {
             return Err(PolicyEngineError::AlreadyInitialized);
         }
 
         admin.require_auth();
-        env.storage().persistent().set(&DataKey::Initialized, &true);
-        env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Initialized, &true);
+        env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
-            .persistent()
+            .instance()
             .set(&DataKey::Version, &INITIAL_VERSION);
-        bump_ttl(&env, &DataKey::Initialized);
-        bump_ttl(&env, &DataKey::Admin);
-        bump_ttl(&env, &DataKey::Version);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
         Initialized {
             admin: admin.clone(),
         }
@@ -147,20 +147,26 @@ impl PolicyEngine {
         Ok(())
     }
 
-    /// Permissionless TTL maintenance for specific, already-existing rule
-    /// entries. Extending TTL does not create authority or alter execution
-    /// semantics (`docs/TECHNICAL_ARCHITECTURE.md` §16.1), so this is
-    /// intentionally open to any caller — an off-chain monitor can refresh
-    /// the entries it knows are still active without needing admin keys.
+    /// Permissionless TTL maintenance. `Initialized`/`Admin`/`Version` live
+    /// in instance storage (one shared TTL, refreshed automatically by
+    /// `ensure_initialized` on every call that reaches it — see that
+    /// function) and are covered by the single `extend_ttl` call below;
+    /// `assets`/`recipients`/`operations` are named, already-existing
+    /// per-entity persistent entries, extended individually the same way
+    /// they always were. Extending TTL does not create authority or alter
+    /// execution semantics (`docs/TECHNICAL_ARCHITECTURE.md` §16.1), so
+    /// this is intentionally open to any caller — an off-chain monitor can
+    /// refresh the entries it knows are still active without needing admin
+    /// keys.
     pub fn extend_ttl(
         env: Env,
         assets: Vec<Address>,
         recipients: Vec<Address>,
         operations: Vec<Symbol>,
     ) {
-        bump_ttl(&env, &DataKey::Initialized);
-        bump_ttl(&env, &DataKey::Admin);
-        bump_ttl(&env, &DataKey::Version);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
         for asset in assets.iter() {
             bump_ttl(&env, &DataKey::Asset(asset));
         }
@@ -241,9 +247,8 @@ impl PolicyEngine {
         }
 
         env.storage()
-            .persistent()
+            .instance()
             .set(&DataKey::Version, &next_version);
-        bump_ttl(&env, &DataKey::Version);
         PolicyVersionBumped { next_version }.publish(&env);
         Ok(())
     }
@@ -314,7 +319,15 @@ fn bump_ttl(env: &Env, key: &DataKey) {
 }
 
 fn ensure_initialized(env: &Env) -> Result<(), PolicyEngineError> {
-    if env.storage().persistent().has(&DataKey::Initialized) {
+    if env.storage().instance().has(&DataKey::Initialized) {
+        // Instance storage holds this contract's own singleton config
+        // (`Initialized`/`Admin`/`Version`) and shares a single TTL across
+        // all of it; refreshing here on every call that reaches this far
+        // covers every entrypoint uniformly, matching `smart_account`'s own
+        // `ensure_initialized`.
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
         Ok(())
     } else {
         Err(PolicyEngineError::NotInitialized)
@@ -325,7 +338,7 @@ fn ensure_admin(env: &Env) -> Result<Address, PolicyEngineError> {
     ensure_initialized(env)?;
     let admin: Address = env
         .storage()
-        .persistent()
+        .instance()
         .get(&DataKey::Admin)
         .ok_or(PolicyEngineError::NotInitialized)?;
     admin.require_auth();
@@ -334,7 +347,7 @@ fn ensure_admin(env: &Env) -> Result<Address, PolicyEngineError> {
 
 fn current_version(env: &Env) -> u32 {
     env.storage()
-        .persistent()
+        .instance()
         .get(&DataKey::Version)
         .unwrap_or(INITIAL_VERSION)
 }
@@ -344,7 +357,9 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::testutils::{storage::Persistent as _, Address as _, Ledger};
+    use soroban_sdk::testutils::{
+        storage::Instance as _, storage::Persistent as _, Address as _, Ledger,
+    };
     use soroban_sdk::vec;
 
     fn setup() -> (Env, PolicyEngineClient<'static>) {
@@ -551,6 +566,40 @@ mod tests {
                 .get_ttl(&DataKey::Asset(asset.clone()))
         });
         assert!(ttl_after_read >= TTL_THRESHOLD_LEDGERS);
+    }
+
+    /// Best-practice review finding: `Initialized`/`Admin`/`Version` used to
+    /// be separate persistent entries, each bumped individually, despite
+    /// never being read or written independently of each other — the
+    /// per-entity data (`Asset`/`Recipient`/`Operation`) genuinely benefits
+    /// from its own TTL, but this singleton config doesn't. Proves the
+    /// migration to instance storage actually happened (not just that the
+    /// code compiles): the keys are absent from persistent storage, and a
+    /// single admin action (`bump_version`) is enough to refresh the whole
+    /// instance's TTL with no separate bump calls, mirroring
+    /// `smart_account::ensure_initialized`'s behavior exactly.
+    #[test]
+    fn singleton_config_lives_in_instance_storage_with_one_shared_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PolicyEngine, ());
+        let client = PolicyEngineClient::new(&env, &contract_id);
+        client.initialize(&Address::generate(&env));
+
+        env.as_contract(&contract_id, || {
+            assert!(!env.storage().persistent().has(&DataKey::Initialized));
+            assert!(!env.storage().persistent().has(&DataKey::Admin));
+            assert!(!env.storage().persistent().has(&DataKey::Version));
+            assert!(env.storage().instance().has(&DataKey::Initialized));
+            assert!(env.storage().instance().has(&DataKey::Admin));
+            assert!(env.storage().instance().has(&DataKey::Version));
+        });
+
+        env.ledger()
+            .with_mut(|l| l.sequence_number += TTL_THRESHOLD_LEDGERS / 2);
+        client.bump_version(&2);
+        let instance_ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(instance_ttl >= TTL_THRESHOLD_LEDGERS);
     }
 
     /// The permissionless maintenance entrypoint extends TTL for the exact

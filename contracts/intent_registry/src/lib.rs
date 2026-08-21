@@ -121,16 +121,16 @@ impl IntentRegistry {
     }
 
     pub fn initialize(env: Env, admin: Address) -> Result<(), IntentRegistryError> {
-        if env.storage().persistent().has(&DataKey::Initialized) {
+        if env.storage().instance().has(&DataKey::Initialized) {
             return Err(IntentRegistryError::AlreadyInitialized);
         }
         admin.require_auth();
-        env.storage().persistent().set(&DataKey::Initialized, &true);
-        env.storage().persistent().set(&DataKey::Admin, &admin);
-        env.storage().persistent().set(&DataKey::Executor, &admin);
-        bump_ttl(&env, &DataKey::Initialized);
-        bump_ttl(&env, &DataKey::Admin);
-        bump_ttl(&env, &DataKey::Executor);
+        env.storage().instance().set(&DataKey::Initialized, &true);
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Executor, &admin);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
         Initialized {
             admin: admin.clone(),
         }
@@ -140,10 +140,7 @@ impl IntentRegistry {
 
     pub fn set_executor(env: Env, executor: Address) -> Result<(), IntentRegistryError> {
         ensure_admin(&env)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Executor, &executor);
-        bump_ttl(&env, &DataKey::Executor);
+        env.storage().instance().set(&DataKey::Executor, &executor);
         ExecutorUpdated {
             executor: executor.clone(),
         }
@@ -153,7 +150,10 @@ impl IntentRegistry {
 
     /// Permissionless TTL maintenance for named, already-existing intents
     /// and their child execution records — extending TTL creates no
-    /// authority (§16.1), so no admin gate is needed.
+    /// authority (§16.1), so no admin gate is needed. `Initialized`/`Admin`/
+    /// `Executor` live in instance storage (one shared TTL, refreshed
+    /// automatically by `ensure_initialized` on every call that reaches
+    /// it), so no separate bump is needed for them here.
     pub fn extend_intent_ttl(env: Env, intent_id: BytesN<32>, child_sequences: Vec<u32>) {
         bump_ttl(&env, &DataKey::Intent(intent_id.clone()));
         for child_sequence in child_sequences.iter() {
@@ -312,7 +312,15 @@ fn bump_ttl(env: &Env, key: &DataKey) {
 }
 
 fn ensure_initialized(env: &Env) -> Result<(), IntentRegistryError> {
-    if env.storage().persistent().has(&DataKey::Initialized) {
+    if env.storage().instance().has(&DataKey::Initialized) {
+        // Instance storage holds this contract's own singleton config
+        // (`Initialized`/`Admin`/`Executor`) and shares a single TTL across
+        // all of it; refreshing here on every call that reaches this far
+        // covers every entrypoint uniformly, matching `smart_account`'s own
+        // `ensure_initialized`.
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
         Ok(())
     } else {
         Err(IntentRegistryError::NotInitialized)
@@ -323,7 +331,7 @@ fn ensure_admin(env: &Env) -> Result<Address, IntentRegistryError> {
     ensure_initialized(env)?;
     let admin: Address = env
         .storage()
-        .persistent()
+        .instance()
         .get(&DataKey::Admin)
         .ok_or(IntentRegistryError::NotInitialized)?;
     admin.require_auth();
@@ -333,7 +341,7 @@ fn ensure_admin(env: &Env) -> Result<Address, IntentRegistryError> {
 fn ensure_executor(env: &Env) -> Result<Address, IntentRegistryError> {
     let executor: Address = env
         .storage()
-        .persistent()
+        .instance()
         .get(&DataKey::Executor)
         .ok_or(IntentRegistryError::UnauthorizedExecutor)?;
     executor.require_auth();
@@ -345,7 +353,9 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::testutils::{storage::Persistent as _, Address as _, Ledger, LedgerInfo};
+    use soroban_sdk::testutils::{
+        storage::Instance as _, storage::Persistent as _, Address as _, Ledger, LedgerInfo,
+    };
 
     fn setup() -> (Env, IntentRegistryClient<'static>, Address) {
         let env = Env::default();
@@ -576,6 +586,40 @@ mod tests {
         let (_env, client, admin) = setup();
         let err = client.try_initialize(&admin);
         assert_eq!(err, Err(Ok(IntentRegistryError::AlreadyInitialized)));
+    }
+
+    /// Best-practice review finding: `Initialized`/`Admin`/`Executor` used
+    /// to be separate persistent entries, each bumped individually, despite
+    /// never being read or written independently of each other. Proves the
+    /// migration to instance storage actually happened: absent from
+    /// persistent storage, present in instance storage, and a single call
+    /// that only touches `Executor` (`set_executor`) is enough to refresh
+    /// the whole instance's TTL via `ensure_initialized`.
+    #[test]
+    fn singleton_config_lives_in_instance_storage_with_one_shared_ttl() {
+        let (env, client, contract_id) = {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(IntentRegistry, ());
+            let client = IntentRegistryClient::new(&env, &contract_id);
+            client.initialize(&Address::generate(&env));
+            (env, client, contract_id)
+        };
+
+        env.as_contract(&contract_id, || {
+            assert!(!env.storage().persistent().has(&DataKey::Initialized));
+            assert!(!env.storage().persistent().has(&DataKey::Admin));
+            assert!(!env.storage().persistent().has(&DataKey::Executor));
+            assert!(env.storage().instance().has(&DataKey::Initialized));
+            assert!(env.storage().instance().has(&DataKey::Admin));
+            assert!(env.storage().instance().has(&DataKey::Executor));
+        });
+
+        env.ledger()
+            .with_mut(|l| l.sequence_number += TTL_THRESHOLD_LEDGERS / 2);
+        client.set_executor(&Address::generate(&env));
+        let instance_ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(instance_ttl >= TTL_THRESHOLD_LEDGERS);
     }
 
     #[test]

@@ -9,7 +9,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the exact version in `rust-toolchain.toml`, not `@stable`
+      # (a floating tag) — this project already got burned once by an
+      # unpinned toolchain (see the `install stellar CLI` step below, where
+      # a *different* floating "stable" broke on a dependency's own
+      # zero-sized-transmute fallback). Keeping this in sync with
+      # `rust-toolchain.toml` means CI and local `cargo`/`rustup` always
+      # agree on which Rust actually built and tested this workspace.
+      - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: rustfmt, clippy
           # `stellar contract build` compiles every contract for this target;

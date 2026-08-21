@@ -674,7 +674,7 @@ fn contract_name_reports_expected_symbol() {
 /// `enforce_owner_auth` (see module docs) — proves the mismatched-caller
 /// branch actually panics, not just that it compiles.
 #[test]
-#[should_panic]
+#[should_panic(expected = "Error(Contract, #8011)")]
 fn pause_rejects_caller_that_does_not_match_owner() {
     let h = setup();
     let impostor = addr(&h.env);
@@ -682,7 +682,7 @@ fn pause_rejects_caller_that_does_not_match_owner() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "Error(Contract, #8011)")]
 fn unpause_rejects_caller_that_does_not_match_owner() {
     let h = setup();
     h.smart_account.pause(&h.owner);

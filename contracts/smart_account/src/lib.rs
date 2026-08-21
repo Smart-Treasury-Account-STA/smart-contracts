@@ -40,7 +40,7 @@ use soroban_sdk::{
     auth::{Context, CustomAccountInterface},
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype,
     crypto::Hash,
-    symbol_short, Address, BytesN, Env, Map, String, Symbol, Val, Vec,
+    panic_with_error, symbol_short, Address, BytesN, Env, Map, String, Symbol, Val, Vec,
 };
 use stellar_access::ownable::{self, Ownable as OzOwnable};
 use stellar_accounts::smart_account::{
@@ -915,10 +915,16 @@ impl OzOwnable for SmartAccountTreasury {}
 
 #[contractimpl(contracttrait)]
 impl OzPausable for SmartAccountTreasury {
+    /// The `Pausable` trait signature returns `()`, not `Result`, so a
+    /// caller/owner mismatch can only be signaled by aborting — done via
+    /// `panic_with_error!` with this contract's own typed error (matching
+    /// every other failure path here) rather than a bare string `panic!`,
+    /// which surfaced as an untyped trap a client couldn't match against
+    /// the way it can `Error(Contract, #8011)`.
     fn pause(e: &Env, caller: Address) {
         let owner = ownable::enforce_owner_auth(e);
         if caller != owner {
-            panic!("caller does not match owner");
+            panic_with_error!(e, SmartAccountTreasuryError::Unauthorized);
         }
         pausable::pause(e);
     }
@@ -926,7 +932,7 @@ impl OzPausable for SmartAccountTreasury {
     fn unpause(e: &Env, caller: Address) {
         let owner = ownable::enforce_owner_auth(e);
         if caller != owner {
-            panic!("caller does not match owner");
+            panic_with_error!(e, SmartAccountTreasuryError::Unauthorized);
         }
         pausable::unpause(e);
     }

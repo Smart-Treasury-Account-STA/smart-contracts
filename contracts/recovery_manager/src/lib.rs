@@ -227,7 +227,7 @@ impl RecoveryManager {
         admin: Address,
         guardian_threshold: u32,
     ) -> Result<(), RecoveryManagerError> {
-        if env.storage().persistent().has(&DataKey::Initialized) {
+        if env.storage().instance().has(&DataKey::Initialized) {
             return Err(RecoveryManagerError::AlreadyInitialized);
         }
         if guardian_threshold == 0 {
@@ -235,14 +235,14 @@ impl RecoveryManager {
         }
 
         admin.require_auth();
-        env.storage().persistent().set(&DataKey::Initialized, &true);
-        env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Initialized, &true);
+        env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
-            .persistent()
+            .instance()
             .set(&DataKey::GuardianThreshold, &guardian_threshold);
-        bump_ttl(&env, &DataKey::Initialized);
-        bump_ttl(&env, &DataKey::Admin);
-        bump_ttl(&env, &DataKey::GuardianThreshold);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
         Initialized {
             admin: admin.clone(),
             guardian_threshold,
@@ -260,11 +260,14 @@ impl RecoveryManager {
     /// already-authorized governance action rather than just delaying it
     /// (independent security review finding). `bump_ttl` no-ops on keys
     /// that don't exist, so calling this with no pending changes is safe.
+    /// `Initialized`/`Admin`/`GuardianThreshold`/`PendingGuardianThreshold`
+    /// live in instance storage (one shared TTL, refreshed automatically by
+    /// `ensure_initialized` on every call that reaches it), so a single
+    /// `extend_ttl` call below covers all of them together.
     pub fn extend_ttl(env: Env, guardians: Vec<Address>, request_ids: Vec<BytesN<32>>) {
-        bump_ttl(&env, &DataKey::Initialized);
-        bump_ttl(&env, &DataKey::Admin);
-        bump_ttl(&env, &DataKey::GuardianThreshold);
-        bump_ttl(&env, &DataKey::PendingGuardianThreshold);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
         for guardian in guardians.iter() {
             bump_ttl(&env, &DataKey::Guardian(guardian.clone()));
             bump_ttl(&env, &DataKey::PendingGuardianRemoval(guardian));
@@ -293,14 +296,13 @@ impl RecoveryManager {
             .checked_add(GUARDIAN_CHANGE_DELAY_LEDGERS)
             .ok_or(RecoveryManagerError::InvalidThreshold)?;
         let key = DataKey::PendingGuardianThreshold;
-        env.storage().persistent().set(
+        env.storage().instance().set(
             &key,
             &PendingThresholdChange {
                 new_threshold,
                 effective_ledger,
             },
         );
-        bump_ttl(&env, &key);
         ThresholdChangeProposed {
             new_threshold,
             effective_ledger,
@@ -315,10 +317,10 @@ impl RecoveryManager {
     pub fn cancel_threshold_change(env: Env) -> Result<(), RecoveryManagerError> {
         ensure_admin(&env)?;
         let key = DataKey::PendingGuardianThreshold;
-        if !env.storage().persistent().has(&key) {
+        if !env.storage().instance().has(&key) {
             return Err(RecoveryManagerError::NoPendingThresholdChange);
         }
-        env.storage().persistent().remove(&key);
+        env.storage().instance().remove(&key);
         ThresholdChangeCancelled {}.publish(&env);
         Ok(())
     }
@@ -326,22 +328,28 @@ impl RecoveryManager {
     /// Applies a pending guardian threshold change once its delay has
     /// elapsed. Permissionless: the authorization decision (the admin
     /// proposing this specific change) already happened, so *when* an
-    /// already-authorized change lands needs no further gate.
+    /// already-authorized change lands needs no further gate. Doesn't call
+    /// `ensure_initialized` (there is nothing to permission-check), so it
+    /// explicitly extends the instance TTL itself on this write, the same
+    /// way `smart_account::apply_adapter_change` does for its own
+    /// instance-storage write.
     pub fn apply_threshold_change(env: Env) -> Result<(), RecoveryManagerError> {
         let key = DataKey::PendingGuardianThreshold;
         let pending: PendingThresholdChange = env
             .storage()
-            .persistent()
+            .instance()
             .get(&key)
             .ok_or(RecoveryManagerError::NoPendingThresholdChange)?;
         if env.ledger().sequence() < pending.effective_ledger {
             return Err(RecoveryManagerError::GuardianChangeDelayNotElapsed);
         }
         env.storage()
-            .persistent()
+            .instance()
             .set(&DataKey::GuardianThreshold, &pending.new_threshold);
-        env.storage().persistent().remove(&key);
-        bump_ttl(&env, &DataKey::GuardianThreshold);
+        env.storage().instance().remove(&key);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
         ThresholdChanged {
             new_threshold: pending.new_threshold,
         }
@@ -489,9 +497,8 @@ impl RecoveryManager {
             return Err(RecoveryManagerError::Unauthorized);
         }
         env.storage()
-            .persistent()
+            .instance()
             .set(&DataKey::GuardianFreezeRequested, &true);
-        bump_ttl(&env, &DataKey::GuardianFreezeRequested);
         GuardianFreezeRequested {
             guardian: guardian.clone(),
         }
@@ -501,7 +508,7 @@ impl RecoveryManager {
 
     pub fn guardian_freeze_requested(env: Env) -> bool {
         env.storage()
-            .persistent()
+            .instance()
             .get(&DataKey::GuardianFreezeRequested)
             .unwrap_or(false)
     }
@@ -526,9 +533,9 @@ impl RecoveryManager {
     /// authority.
     pub fn consume_guardian_freeze_request(env: Env) -> bool {
         let key = DataKey::GuardianFreezeRequested;
-        let requested = env.storage().persistent().get(&key).unwrap_or(false);
+        let requested = env.storage().instance().get(&key).unwrap_or(false);
         if requested {
-            env.storage().persistent().remove(&key);
+            env.storage().instance().remove(&key);
         }
         requested
     }
@@ -555,7 +562,7 @@ impl RecoveryManager {
         caller.require_auth();
         let admin: Address = env
             .storage()
-            .persistent()
+            .instance()
             .get(&DataKey::Admin)
             .ok_or(RecoveryManagerError::NotInitialized)?;
         if caller != admin && !is_active_guardian(&env, &caller) {
@@ -727,7 +734,16 @@ fn bump_ttl(env: &Env, key: &DataKey) {
 }
 
 fn ensure_initialized(env: &Env) -> Result<(), RecoveryManagerError> {
-    if env.storage().persistent().has(&DataKey::Initialized) {
+    if env.storage().instance().has(&DataKey::Initialized) {
+        // Instance storage holds this contract's own singleton config
+        // (`Initialized`/`Admin`/`GuardianThreshold`/
+        // `PendingGuardianThreshold`/`GuardianFreezeRequested`) and shares a
+        // single TTL across all of it; refreshing here on every call that
+        // reaches this far covers every entrypoint uniformly, matching
+        // `smart_account`'s own `ensure_initialized`.
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
         Ok(())
     } else {
         Err(RecoveryManagerError::NotInitialized)
@@ -738,7 +754,7 @@ fn ensure_admin(env: &Env) -> Result<Address, RecoveryManagerError> {
     ensure_initialized(env)?;
     let admin: Address = env
         .storage()
-        .persistent()
+        .instance()
         .get(&DataKey::Admin)
         .ok_or(RecoveryManagerError::NotInitialized)?;
     admin.require_auth();
@@ -747,7 +763,7 @@ fn ensure_admin(env: &Env) -> Result<Address, RecoveryManagerError> {
 
 fn guardian_threshold(env: &Env) -> u32 {
     env.storage()
-        .persistent()
+        .instance()
         .get(&DataKey::GuardianThreshold)
         .unwrap_or(1)
 }
@@ -793,7 +809,9 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::testutils::{storage::Persistent as _, Address as _, Ledger, LedgerInfo};
+    use soroban_sdk::testutils::{
+        storage::Instance as _, storage::Persistent as _, Address as _, Ledger, LedgerInfo,
+    };
 
     fn setup() -> (Env, RecoveryManagerClient<'static>, Address) {
         let env = Env::default();
@@ -1301,17 +1319,16 @@ mod tests {
             &soroban_sdk::vec![&env],
         );
 
-        let threshold_ttl = env.as_contract(&contract_id, || {
-            env.storage()
-                .persistent()
-                .get_ttl(&DataKey::PendingGuardianThreshold)
-        });
+        // `PendingGuardianThreshold` now lives in instance storage (see the
+        // singleton-config migration below), so its TTL is the instance
+        // TTL, not a per-key persistent one.
+        let instance_ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
         let removal_ttl = env.as_contract(&contract_id, || {
             env.storage()
                 .persistent()
                 .get_ttl(&DataKey::PendingGuardianRemoval(guardian))
         });
-        assert!(threshold_ttl >= TTL_THRESHOLD_LEDGERS);
+        assert!(instance_ttl >= TTL_THRESHOLD_LEDGERS);
         assert!(removal_ttl >= TTL_THRESHOLD_LEDGERS);
     }
 
@@ -1336,6 +1353,39 @@ mod tests {
         let (env, client, _admin) = setup();
         let err = client.try_initialize(&Address::generate(&env), &2);
         assert_eq!(err, Err(Ok(RecoveryManagerError::AlreadyInitialized)));
+    }
+
+    /// Best-practice review finding: `Initialized`/`Admin`/`GuardianThreshold`
+    /// used to be separate persistent entries, each bumped individually,
+    /// despite never being read or written independently of each other —
+    /// unlike `Guardian(addr)`/`Request(id)`, which genuinely are per-entity
+    /// and correctly stay persistent. Proves the migration to instance
+    /// storage actually happened, and that touching only `GuardianThreshold`
+    /// (via `propose_threshold_change`) is enough to refresh the whole
+    /// instance's shared TTL.
+    #[test]
+    fn singleton_config_lives_in_instance_storage_with_one_shared_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(RecoveryManager, ());
+        let client = RecoveryManagerClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &2);
+
+        env.as_contract(&contract_id, || {
+            assert!(!env.storage().persistent().has(&DataKey::Initialized));
+            assert!(!env.storage().persistent().has(&DataKey::Admin));
+            assert!(!env.storage().persistent().has(&DataKey::GuardianThreshold));
+            assert!(env.storage().instance().has(&DataKey::Initialized));
+            assert!(env.storage().instance().has(&DataKey::Admin));
+            assert!(env.storage().instance().has(&DataKey::GuardianThreshold));
+        });
+
+        env.ledger()
+            .with_mut(|l| l.sequence_number += TTL_THRESHOLD_LEDGERS / 2);
+        client.propose_threshold_change(&3);
+        let instance_ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(instance_ttl >= TTL_THRESHOLD_LEDGERS);
     }
 
     #[test]
