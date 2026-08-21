@@ -1573,6 +1573,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sta-account-factory"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+ "sta-intent-registry",
+ "sta-policy-engine",
+ "sta-recovery-manager",
+ "sta-smart-account",
+ "sta-split-adapter",
+ "sta-transfer-adapter",
+ "stellar-accounts",
+]
+
+[[package]]
 name = "sta-governance-account"
 version = "0.1.0"
 dependencies = [

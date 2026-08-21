@@ -124,6 +124,8 @@ All three read back exactly the state written during initialization/wiring above
 
 ### 6.3 `intent_registry` bootstrapped with a hand-built custom-account authorization
 
+**This section is a historical record of this specific, already-deployed testnet instance.** `smart_account::initialize` now performs this same bootstrap itself, internally, via Soroban's invoker-shortcut — see its doc comment in `contracts/smart_account/src/lib.rs` and `docs/SECURITY_REVIEW_STRICT.md`. Any *new* deployment (via `scripts/deploy_testnet.sh` or `contracts/account_factory`) no longer needs `scripts/bootstrap_intent_registry.py` at all; it remains only as a reference for how this deployment's `intent_registry` (`CDHTNPBXUMPCKUJ76HQ767MDRD4IVRRH4H5DOF4JUOO36QKSV4GXFRMR`) actually got initialized, below.
+
 `intent_registry`'s `admin` must be `smart_account` itself (`contracts/smart_account/src/lib.rs`'s `create_intent`/`cancel_intent` call `IntentRegistryClient::create_intent`/`cancel_intent` directly, both `ensure_admin`-gated on the intent_registry side). So `intent_registry.initialize(admin=smart_account)`'s `admin.require_auth()` requires authorization *from `smart_account`* — a Soroban custom account, not a plain keypair — which the bare `stellar` CLI cannot produce (see §7).
 
 `scripts/bootstrap_intent_registry.py` closes this gap for this one bootstrapping call by hand-constructing the two Soroban authorization entries `do_check_auth`/`authenticate` (`stellar-accounts-0.7.2/src/smart_account/storage.rs`) actually require, without any wallet/SDK layer:

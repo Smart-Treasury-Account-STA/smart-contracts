@@ -20,13 +20,13 @@
 # signer-gated flows are proven instead (local integration tests using
 # `mock_all_auths()`, plus `webauthn_verifier`'s real-cryptography fixtures).
 #
-# Adapter wiring is a two-step, real-time-delayed process (independent
-# security review finding — see `docs/SMART_CONTRACT_AUDIT_REPORT.md` and
-# `docs/V1_SCOPE.md` §6): `propose_adapter_change` takes effect only after
-# ~1 day (17280 ledgers) has actually elapsed on testnet, so this script
-# proposes the change and prints the follow-up `apply_adapter_change`
-# commands to run once that real delay has passed — it cannot apply them
-# itself within a single run.
+# Adapters are bound directly at `initialize` via its `initial_adapters`
+# argument — no timelock, since this is the account's first-ever
+# configuration (see that function's doc comment in
+# contracts/smart_account/src/lib.rs). Only *later* rebindings on an
+# already-funded, already-operating treasury go through
+# `propose_adapter_change`/`apply_adapter_change`'s ~1 day timelock
+# (independent security review finding — see `docs/V1_SCOPE.md` §6).
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -82,19 +82,25 @@ stellar contract invoke --id "$SPLIT_ADAPTER" --source "$DEPLOYER" --network "$N
   initialize --admin "$DEPLOYER_ADDR" --smart_account "$SMART_ACCOUNT"
 
 echo "== Initializing smart_account (owner + founding Ed25519 wallet signer) =="
+# smart_account::initialize bootstraps intent_registry itself, passing its
+# own address as admin via Soroban's invoker-shortcut -- intent_registry
+# must be deployed but left UNINITIALIZED going into this call (that is
+# already the case above: only webauthn_verifier/policy_engine/
+# recovery_manager were initialized separately). See that function's doc
+# comment in contracts/smart_account/src/lib.rs for why this needs no
+# separate authorization step, unlike a prior version of this script.
 stellar contract invoke --id "$SMART_ACCOUNT" --source "$DEPLOYER" --network "$NETWORK" -- initialize \
   --owner "$DEPLOYER_ADDR" \
   --initial_signers "[{\"Delegated\":\"$DEPLOYER_ADDR\"}]" \
   --initial_policies '{}' \
-  --policy_engine "$POLICY_ENGINE" \
-  --intent_registry "$INTENT_REGISTRY" \
-  --recovery_manager "$RECOVERY_MANAGER"
+  --config "{\"policy_engine\":\"$POLICY_ENGINE\",\"intent_registry\":\"$INTENT_REGISTRY\",\"recovery_manager\":\"$RECOVERY_MANAGER\",\"initial_adapters\":{\"transfer\":\"$TRANSFER_ADAPTER\",\"split\":\"$SPLIT_ADAPTER\"},\"initial_executor\":\"$DEPLOYER_ADDR\"}"
+# DEPLOYER is a placeholder executor here, not a real relayer identity --
+# rotate it with scripts/set_intent_executor.py once a real relayer key
+# exists (that script still needs smart_account's own custom-account
+# authorization, same as before; only the *initial* executor is set for
+# free by initialize now).
 
-echo "== Proposing adapter wiring into smart_account (owner-gated, not signer-gated; takes ~1 day to apply) =="
-stellar contract invoke --id "$SMART_ACCOUNT" --source "$DEPLOYER" --network "$NETWORK" -- \
-  propose_adapter_change --operation transfer --adapter "$TRANSFER_ADAPTER"
-stellar contract invoke --id "$SMART_ACCOUNT" --source "$DEPLOYER" --network "$NETWORK" -- \
-  propose_adapter_change --operation split --adapter "$SPLIT_ADAPTER"
+echo "== Adapters bound at initialize (no timelock for this first-ever binding; see initialize's doc comment) =="
 
 echo "== Registering a guardian =="
 stellar contract invoke --id "$RECOVERY_MANAGER" --source "$DEPLOYER" --network "$NETWORK" -- \
@@ -139,18 +145,10 @@ stellar contract invoke --id "$POLICY_ENGINE" --source "$DEPLOYER" --network "$N
 set -e
 
 echo "== Done. Record the printed contract IDs in docs/TESTNET_DEPLOYMENT.md. =="
-echo "NOTE: intent_registry is deployed but not yet initialized here — its"
-echo "admin must be smart_account itself, which requires smart_account's own"
-echo "custom-account authorization (not a plain CLI signature). Bootstrap it"
-echo "separately with:"
-echo "  python3 scripts/bootstrap_intent_registry.py \\"
-echo "    --smart-account $SMART_ACCOUNT --intent-registry $INTENT_REGISTRY"
-echo "See docs/TESTNET_DEPLOYMENT.md §6.3 for what that script does and why."
-echo
-echo "NOTE: the adapter wiring proposed above does not take effect until"
-echo "~1 day (17280 ledgers) has actually passed on testnet. Once it has,"
-echo "run:"
-echo "  stellar contract invoke --id $SMART_ACCOUNT --source $DEPLOYER --network $NETWORK -- \\"
-echo "    apply_adapter_change --operation transfer"
-echo "  stellar contract invoke --id $SMART_ACCOUNT --source $DEPLOYER --network $NETWORK -- \\"
-echo "    apply_adapter_change --operation split"
+echo "NOTE: intent_registry no longer needs a separate bootstrap step --"
+echo "smart_account::initialize (above) already initialized it directly,"
+echo "with smart_account itself as admin. scripts/bootstrap_intent_registry.py"
+echo "remains only for the existing testnet deployment, which was already"
+echo "bootstrapped the old way before this script was updated; do not run it"
+echo "against a smart_account deployed with this version of the script --"
+echo "intent_registry.initialize would simply reject the second call."

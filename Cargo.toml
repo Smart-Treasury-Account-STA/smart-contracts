@@ -9,6 +9,7 @@ members = [
     "contracts/split_adapter",
     "contracts/threshold_policy",
     "contracts/governance_account",
+    "contracts/account_factory",
 ]
 resolver = "2"
 

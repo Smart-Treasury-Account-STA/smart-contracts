@@ -31,7 +31,10 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{storage::Instance as _, storage::Persistent as _, Address as _, Ledger},
+    testutils::{
+        storage::Instance as _, storage::Persistent as _, Address as _, Ledger, MockAuth,
+        MockAuthInvoke,
+    },
     token::StellarAssetClient,
     token::TokenClient,
     vec, Address, Env, IntoVal, Map, String, Symbol,
@@ -39,8 +42,8 @@ use soroban_sdk::{
 use stellar_accounts::smart_account::{ContextRuleType, Signer};
 
 use crate::{
-    AccountStatus, ScheduledIntentArgs, SmartAccountTreasury, SmartAccountTreasuryClient,
-    SmartAccountTreasuryError,
+    AccountStatus, InitConfig, ScheduledIntentArgs, SmartAccountTreasury,
+    SmartAccountTreasuryClient, SmartAccountTreasuryError,
 };
 
 fn addr(e: &Env) -> Address {
@@ -74,6 +77,10 @@ fn setup() -> Harness {
     let policy_engine = sta_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id);
     policy_engine.initialize(&owner);
 
+    // Deployed but deliberately left uninitialized here: `smart_account`'s
+    // own `initialize` bootstraps it directly, passing itself as `admin` via
+    // the invoker-shortcut (see that function's doc comment) — no separate
+    // hand-built authorization needed.
     let intent_registry_id = env.register(sta_intent_registry::IntentRegistry, ());
     let intent_registry = sta_intent_registry::IntentRegistryClient::new(&env, &intent_registry_id);
 
@@ -84,13 +91,6 @@ fn setup() -> Harness {
 
     let smart_account_id = env.register(SmartAccountTreasury, ());
     let smart_account = SmartAccountTreasuryClient::new(&env, &smart_account_id);
-
-    // intent_registry trusts the treasury contract itself as admin, so
-    // `create_scheduled_payment` can create intents as a nested call under
-    // the treasury's own authorized invocation (see module docs on the
-    // `create_scheduled_payment` entrypoint).
-    intent_registry.initialize(&smart_account_id);
-    intent_registry.set_executor(&relayer);
 
     let transfer_adapter_id = env.register(sta_transfer_adapter::TransferAdapter, ());
     let transfer_adapter =
@@ -106,9 +106,13 @@ fn setup() -> Harness {
         &owner,
         &vec![&env, founding_signer],
         &Map::new(&env),
-        &policy_engine_id,
-        &intent_registry_id,
-        &recovery_manager_id,
+        &InitConfig {
+            policy_engine: policy_engine_id.clone(),
+            intent_registry: intent_registry_id.clone(),
+            recovery_manager: recovery_manager_id.clone(),
+            initial_adapters: Map::new(&env),
+            initial_executor: relayer.clone(),
+        },
     );
     // Adapter changes are timelocked (independent security review finding;
     // see `docs/SMART_CONTRACT_AUDIT_REPORT.md`): propose, advance past the
@@ -163,6 +167,145 @@ fn initializes_and_reports_status() {
     assert!(status.initialized);
     assert!(!status.paused);
     assert!(!status.frozen);
+}
+
+/// Proves the invoker-shortcut claim in `initialize`'s doc comment for
+/// real, rather than taking it on faith: `env.mock_all_auths()` would
+/// satisfy *any* `require_auth()` regardless of whether the shortcut
+/// actually applies, so it cannot tell the two apart. This test instead
+/// authorizes *only* `owner` for the exact `initialize` call, with an empty
+/// `sub_invokes` list — no separate auth entry for `intent_registry`'s own
+/// `admin.require_auth()` at all. If the shortcut did not hold, this call
+/// would panic with a missing-authorization error instead of succeeding.
+#[test]
+fn initialize_bootstraps_intent_registry_with_no_separate_authorization() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let owner = addr(&env);
+
+    let policy_engine_id = env.register(sta_policy_engine::PolicyEngine, ());
+    sta_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id).initialize(&owner);
+
+    let intent_registry_id = env.register(sta_intent_registry::IntentRegistry, ());
+
+    let recovery_manager_id = env.register(sta_recovery_manager::RecoveryManager, ());
+    sta_recovery_manager::RecoveryManagerClient::new(&env, &recovery_manager_id)
+        .initialize(&owner, &1);
+
+    let smart_account_id = env.register(SmartAccountTreasury, ());
+    let smart_account = SmartAccountTreasuryClient::new(&env, &smart_account_id);
+    let initial_signers = vec![&env, Signer::Delegated(addr(&env))];
+    let initial_policies = Map::new(&env);
+
+    let config = InitConfig {
+        policy_engine: policy_engine_id.clone(),
+        intent_registry: intent_registry_id.clone(),
+        recovery_manager: recovery_manager_id.clone(),
+        initial_adapters: Map::new(&env),
+        initial_executor: owner.clone(),
+    };
+
+    smart_account
+        .mock_auths(&[MockAuth {
+            address: &owner,
+            invoke: &MockAuthInvoke {
+                contract: &smart_account_id,
+                fn_name: "initialize",
+                args: (
+                    owner.clone(),
+                    initial_signers.clone(),
+                    initial_policies.clone(),
+                    config.clone(),
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .initialize(&owner, &initial_signers, &initial_policies, &config);
+
+    let status = smart_account.status();
+    assert!(status.initialized);
+
+    // Restore blanket auth mocking (the call above deliberately used a
+    // precise, narrower list) so the check below can only fail for
+    // `AlreadyInitialized`, not for a missing auth entry of its own.
+    env.mock_all_auths();
+    let intent_registry = sta_intent_registry::IntentRegistryClient::new(&env, &intent_registry_id);
+    // A second `initialize` call is only reachable if the first one already
+    // landed — proves `intent_registry` is genuinely initialized, not just
+    // that `smart_account.initialize` itself returned Ok.
+    let already_initialized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        intent_registry.initialize(&owner);
+    }))
+    .is_err();
+    assert!(already_initialized);
+}
+
+/// Proves `initial_adapters` genuinely binds adapters with zero delay, in
+/// contrast to `propose_adapter_change`/`apply_adapter_change`'s ~1 day
+/// timelock for every later change: a payment executes successfully on the
+/// very same ledger `initialize` ran on, no `apply_adapter_change` call or
+/// ledger advance anywhere in this test.
+#[test]
+fn initial_adapters_are_usable_immediately_with_no_timelock() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let owner = addr(&env);
+
+    let policy_engine_id = env.register(sta_policy_engine::PolicyEngine, ());
+    let policy_engine = sta_policy_engine::PolicyEngineClient::new(&env, &policy_engine_id);
+    policy_engine.initialize(&owner);
+
+    let intent_registry_id = env.register(sta_intent_registry::IntentRegistry, ());
+
+    let recovery_manager_id = env.register(sta_recovery_manager::RecoveryManager, ());
+    sta_recovery_manager::RecoveryManagerClient::new(&env, &recovery_manager_id)
+        .initialize(&owner, &1);
+
+    let smart_account_id = env.register(SmartAccountTreasury, ());
+    let smart_account = SmartAccountTreasuryClient::new(&env, &smart_account_id);
+
+    let transfer_adapter_id = env.register(sta_transfer_adapter::TransferAdapter, ());
+    sta_transfer_adapter::TransferAdapterClient::new(&env, &transfer_adapter_id)
+        .initialize(&owner, &smart_account_id);
+
+    let founding_signer = Signer::Delegated(addr(&env));
+    let mut initial_adapters = Map::new(&env);
+    initial_adapters.set(Symbol::new(&env, "transfer"), transfer_adapter_id);
+    smart_account.initialize(
+        &owner,
+        &vec![&env, founding_signer],
+        &Map::new(&env),
+        &InitConfig {
+            policy_engine: policy_engine_id,
+            intent_registry: intent_registry_id,
+            recovery_manager: recovery_manager_id,
+            initial_adapters,
+            initial_executor: owner.clone(),
+        },
+    );
+
+    let token = env
+        .register_stellar_asset_contract_v2(owner.clone())
+        .address();
+    StellarAssetClient::new(&env, &token).mint(&smart_account_id, &1_000);
+
+    let recipient = addr(&env);
+    policy_engine.set_operation_allowed(&Symbol::new(&env, "transfer"), &true);
+    policy_engine.set_asset_rule(
+        &token,
+        &sta_policy_engine::AssetRule {
+            enabled: true,
+            max_single_transfer: 10_000,
+        },
+    );
+    policy_engine.set_recipient_allowed(&recipient, &true);
+
+    smart_account.execute_transfer_payment(&token, &recipient, &400, &1, &1);
+
+    assert_eq!(TokenClient::new(&env, &token).balance(&recipient), 400);
 }
 
 #[test]
@@ -316,6 +459,44 @@ fn scheduled_payment_creation_and_relayer_triggered_execution() {
     assert_eq!(token_client.balance(&recipient), 250);
     assert!(h.intent_registry.is_child_executed(&intent_id, &1));
     let _ = h.relayer; // relayer address is the configured intent_registry executor
+}
+
+/// Security review finding: `IntentRegistry::initialize` defaults
+/// `Executor` to whatever `admin` it's given, which is this treasury's own
+/// address — and `execute_scheduled_payment`'s nested call into
+/// `intent_registry.mark_child_executed` would satisfy that default
+/// `Executor`'s `require_auth()` via the invoker-shortcut regardless of who
+/// called `execute_scheduled_payment`, silently making it callable by
+/// anyone. `setup()`'s harness passes `relayer` as `initial_executor`
+/// specifically to avoid that default; this test proves the gate is real
+/// with a genuinely unauthorized caller — no mocked or real authorization
+/// for `relayer` at all.
+#[test]
+#[should_panic]
+fn execute_scheduled_payment_without_executor_authorization_fails() {
+    let h = setup();
+    let recipient = addr(&h.env);
+    allow_payment(&h, &recipient);
+
+    let intent_id = soroban_sdk::BytesN::from_array(&h.env, &[11u8; 32]);
+    h.env.ledger().with_mut(|l| l.sequence_number = 10);
+    h.smart_account
+        .create_scheduled_payment(&ScheduledIntentArgs {
+            intent_id: intent_id.clone(),
+            asset: h.token.clone(),
+            destination: recipient,
+            amount: 250,
+            start_ledger: 10,
+            end_ledger: 20,
+            max_executions: 1,
+            execution_count: 0,
+            policy_version: 999,
+            adapter: addr(&h.env),
+            cancelled: false,
+        });
+
+    h.env.set_auths(&[]);
+    h.smart_account.execute_scheduled_payment(&intent_id, &1);
 }
 
 /// Audit finding, now fixed: `execute_scheduled_payment` must ignore any
@@ -829,9 +1010,13 @@ fn creating_a_scheduled_payment_before_an_adapter_is_configured_is_rejected() {
         &owner,
         &vec![&env, founding_signer],
         &Map::new(&env),
-        &policy_engine_id,
-        &intent_registry_id,
-        &recovery_manager_id,
+        &InitConfig {
+            policy_engine: policy_engine_id,
+            intent_registry: intent_registry_id,
+            recovery_manager: recovery_manager_id,
+            initial_adapters: Map::new(&env),
+            initial_executor: owner.clone(),
+        },
     );
     // Deliberately never proposing/applying an adapter for "transfer".
 

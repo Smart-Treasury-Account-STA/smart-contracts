@@ -64,6 +64,20 @@ pub struct AccountStatus {
     pub policy_version_hint: u32,
 }
 
+/// Groups `initialize`'s subordinate-module wiring into one argument —
+/// clippy's `too_many_arguments` lint (max 7) is why this exists as a
+/// struct rather than five more positional parameters; see `initialize`'s
+/// doc comment for what each field actually does.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitConfig {
+    pub policy_engine: Address,
+    pub intent_registry: Address,
+    pub recovery_manager: Address,
+    pub initial_adapters: Map<Symbol, Address>,
+    pub initial_executor: Address,
+}
+
 /// Local mirror of `recovery_manager::RecoveryRequest` — Soroban contract
 /// types are decoded structurally by field name/type, so this does not
 /// require a shared crate dependency on `recovery_manager` (which would
@@ -277,30 +291,92 @@ impl SmartAccountTreasury {
 
     /// Bootstraps the treasury: sets the owner, seeds a `Default` context
     /// rule with the founding signers/policies (e.g. wallet signers plus a
-    /// `weighted_threshold` policy, or passkey `External` signers), and
-    /// pins the subordinate module addresses.
+    /// `weighted_threshold` policy, or passkey `External` signers), pins the
+    /// subordinate module addresses, and bootstraps `intent_registry` in the
+    /// same call (see below).
     ///
     /// This calls the OZ storage primitives directly (`ownable::set_owner`,
     /// `add_context_rule`) instead of going through their `Ownable`/
     /// `SmartAccount` trait entrypoints, both of which require an
     /// already-authorized owner/signer to exist — impossible to satisfy
     /// before the very first signer is registered.
+    ///
+    /// `intent_registry` must be a **freshly deployed, not-yet-initialized**
+    /// `IntentRegistry` instance. This function initializes it directly,
+    /// passing `env.current_contract_address()` (this treasury) as its
+    /// `admin` — which is the whole reason it needs to happen here rather
+    /// than as a separate call from outside. `IntentRegistry::initialize`
+    /// requires `admin.require_auth()`; with `admin` set to this treasury's
+    /// own address and this treasury as the *direct* caller of that
+    /// `initialize` call, Soroban's invoker-shortcut satisfies that
+    /// `require_auth()` with no signature at all — the same mechanism that
+    /// already lets `transfer_adapter`/`split_adapter` check
+    /// `smart_account.require_auth()` with no separate auth entry when
+    /// *this* contract is their direct caller. Doing this from *outside* (a
+    /// plain keypair calling `intent_registry.initialize(smart_account_addr)`
+    /// directly) does not get that shortcut — `smart_account_addr` is not
+    /// the caller in that call, so it would need a real signed
+    /// `AuthPayload` sub-invocation proving the treasury's own signers
+    /// approved being named as `admin`, before the treasury has any
+    /// registered signers to produce one. That chicken-and-egg problem is
+    /// exactly what `scripts/bootstrap_intent_registry.py` existed to work
+    /// around; folding the call in here removes the need for it in any new
+    /// deployment.
+    ///
+    /// `initial_adapters` sets the `transfer`/`split`/… adapter bindings
+    /// directly, with no timelock — unlike `propose_adapter_change`'s ~1
+    /// day delay for every *later* change. That delay exists to stop an
+    /// already-trusted binding from being swapped out from under a funded,
+    /// operating treasury; it protects nothing here, since this is the
+    /// account's first-ever configuration and it holds no funds yet. Empty
+    /// is fine — adapters can always be added later via the normal
+    /// propose/apply path.
+    ///
+    /// `initial_executor` sets `intent_registry`'s `Executor` explicitly,
+    /// for the same reason `initial_adapters` exists: `IntentRegistry::
+    /// initialize` defaults `Executor` to whatever `admin` it was given —
+    /// which is *this treasury's own address* (see above). Left alone,
+    /// `execute_scheduled_payment`'s call into
+    /// `intent_registry.mark_child_executed` would satisfy `Executor`'s
+    /// `require_auth()` via the same invoker-shortcut this treasury is the
+    /// direct caller of, regardless of who called `execute_scheduled_payment`
+    /// itself — silently defeating that entrypoint's documented "an
+    /// operational relayer key gates *when* execution happens" property for
+    /// any account that skips this. Pass the intended relayer's address
+    /// here explicitly; passing `env.current_contract_address()` again is a
+    /// valid, deliberate choice too (anyone may trigger execution), but it
+    /// should be a choice, not an accident of `IntentRegistry`'s own
+    /// generic default.
     pub fn initialize(
         env: Env,
         owner: Address,
         initial_signers: Vec<Signer>,
         initial_policies: Map<Address, Val>,
-        policy_engine: Address,
-        intent_registry: Address,
-        recovery_manager: Address,
+        config: InitConfig,
     ) -> Result<(), SmartAccountTreasuryError> {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(SmartAccountTreasuryError::AlreadyInitialized);
         }
         owner.require_auth();
 
+        let InitConfig {
+            policy_engine,
+            intent_registry,
+            recovery_manager,
+            initial_adapters,
+            initial_executor,
+        } = config;
+
         ownable::set_owner(&env, &owner);
         add_context_rule_root(&env, &initial_signers, &initial_policies);
+        let intent_registry_client = IntentRegistryClient::new(&env, &intent_registry);
+        intent_registry_client.initialize(&env.current_contract_address());
+        intent_registry_client.set_executor(&initial_executor);
+        for (operation, adapter) in initial_adapters.iter() {
+            env.storage()
+                .instance()
+                .set(&DataKey::Adapter(operation), &adapter);
+        }
 
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage()
@@ -815,6 +891,8 @@ pub struct ScheduledIntentArgs {
 #[contractclient(name = "IntentRegistryClient")]
 #[allow(unused)]
 trait IntentRegistryInterface {
+    fn initialize(env: Env, admin: Address);
+    fn set_executor(env: Env, executor: Address);
     fn create_intent(env: Env, intent: ScheduledIntentArgs);
     fn cancel_intent(env: Env, intent_id: BytesN<32>);
     fn mark_child_executed(env: Env, intent_id: BytesN<32>, child_sequence: u32);

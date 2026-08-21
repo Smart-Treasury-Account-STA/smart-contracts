@@ -2,5 +2,6 @@
 /.soroban
 **/test_snapshots/
 *.wasm
+!contracts/account_factory/src/wasm_fixtures/*.wasm
 *.log
 .DS_Store
