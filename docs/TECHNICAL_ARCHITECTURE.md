@@ -249,6 +249,7 @@ Diagrams use Mermaid so they render directly in GitHub. Tables define authority,
 - Relayer architecture: Section 10.4
 - Intent state machine: Section 11.7
 - Execution sequence diagrams: Section 12
+- Roles and transaction reference: Section 12.8
 - Deployment topology: Section 17.4
 
 ### 3.3 External Stellar References
@@ -1574,6 +1575,120 @@ Diagram explanation:
 - Old signers and sessions are cleared before new authority is installed and the policy version increments.
 
 Key takeaway: recovery is intentionally slower and stricter than normal spend flows because it can replace account authority.
+
+## 12.8 Complete Role and Transaction Reference
+
+Every entrypoint across the workspace, organized by *who* can call it rather than by contract — every gate below was re-read directly from source (not assumed from an earlier doc pass) as part of `docs/SECURITY_REVIEW_STRICT.md`'s review. `contracts/account_factory`, added alongside this reference, is what makes §12.1 ("Create a Smart Treasury Account") actually reachable by a user in one call rather than requiring the seven-deployment manual sequence `scripts/deploy_testnet.sh` still documents for reference.
+
+### Roles
+
+- **Owner** — a single `Address` (`ownable::Owner` on `smart_account`), checked via plain `require_auth()`. Set at `initialize`, replaceable via a two-step transfer. May be a classic keypair, or `contracts/governance_account`'s address for N-of-M multisig control (see §12.7's neighbor doc, `docs/GOVERNANCE_MULTISIG_DESIGN.md`).
+- **Context rule signers** — whoever `smart_account`'s own composed OZ `SmartAccount`/`CustomAccountInterface` recognizes as satisfying a given context rule (a wallet key, a passkey via `webauthn_verifier`, or an N-of-M/weighted policy over several signers). Checked via `__check_auth`, entirely independent of `owner`.
+- **Guardians** — addresses registered on `recovery_manager` via `add_guardian`, active only after `GUARDIAN_ACTIVATION_DELAY_LEDGERS` has passed since registration.
+- **`recovery_manager`'s admin** — a separate `Address` set at that contract's own `initialize`. By convention every deployment tool in this workspace (`scripts/deploy_testnet.sh`, `account_factory`) sets it to the same identity as `owner`, but nothing in the code enforces that — it is a distinct, independently configurable role.
+- **`policy_engine`'s admin** — same pattern: a separate field, conventionally the same identity as `owner`, not code-enforced.
+- **`intent_registry`'s admin** — always `smart_account`'s own contract address (see §12.4 and `smart_account::initialize`'s doc comment for why this can only be true, not merely conventional). No human ever calls `intent_registry` directly for anything admin-gated; every such action is reached through a `smart_account` entrypoint that makes the nested call itself.
+- **Executor / relayer** (`intent_registry`'s `Executor` field) — deliberately untrusted (`docs/TECHNICAL_ARCHITECTURE.md` §13.1: "relayer MUST NOT hold owner, governance, recovery, or management authority"). Gates only *when*, within an already-approved window, a scheduled payment fires — never the destination, asset, amount, or policy version, all of which are pinned to the canonical intent regardless of who the executor is.
+- **Anyone / permissionless** — deploying via `account_factory`, every `extend_*_ttl` maintenance call, and every "pull an already-authorized fact" entrypoint (`apply_adapter_change`, `apply_threshold_change`, `apply_guardian_removal`, `apply_recovery`, `apply_guardian_freeze`, `finalize_recovery`) — each of these is safe to leave open to any caller specifically because the real authorization decision already happened earlier (a proposal, a guardian quorum, a timelock), and calling the `apply_*`/`finalize_*` step itself grants no new authority.
+
+**One role relationship worth stating plainly, not just implying:** context rule signers are not scoped to payments. The same signers who can move funds can also add/remove signers, create/remove context rules, and attach/detach policies (§ "context rule signers" above) — including creating a *new* rule that grants themselves broader authority. Distributing `owner` to a multisig (`governance_account`) protects the four owner-gated actions in the table below; it does **not** protect this. This is a deliberate, named residual risk, not an oversight — see `docs/GOVERNANCE_MULTISIG_DESIGN.md` §9 and `docs/SECURITY_REVIEW_STRICT.md` finding 4 for the full reasoning and why the obvious fix (require owner auth too) was evaluated and not applied.
+
+```mermaid
+graph TD
+    A1["Anyone"] -->|"deploy_account(...)"| F["account_factory"]
+    F -->|"deploys & wires all six contracts"| SA["smart_account<br/>(+ policy_engine, intent_registry,<br/>recovery_manager, adapters)"]
+
+    O["Owner<br/>(single key, or governance_account<br/>for N-of-M multisig)"] --> O1["propose_adapter_change / cancel_adapter_change"]
+    O --> O2["freeze"]
+    O --> O3["pause / unpause"]
+    O --> O4["transfer_ownership / accept_ownership / renounce_ownership"]
+
+    S["Context Rule Signers<br/>(smart_account's own signer/threshold system)"] --> S1["execute_transfer_payment / execute_split_payment"]
+    S --> S2["create_scheduled_payment / cancel_scheduled_payment"]
+    S -.->|"also controls -- see note above"| S3["add/remove_signer, add/remove_context_rule,<br/>add/remove_policy"]
+
+    G["Guardians"] --> G1["request_guardian_freeze"]
+    G --> G2["open_recovery / approve_recovery"]
+
+    RA["recovery_manager Admin"] --> RA1["add_guardian, propose/cancel_remove_guardian"]
+    RA --> RA2["propose/cancel_threshold_change"]
+    RA --> RA3["cancel_recovery"]
+
+    PA["policy_engine Admin"] --> PA1["set_asset_rule, set_recipient_allowed,<br/>set_operation_allowed, bump_version"]
+
+    EX["Executor / Relayer"] --> EX1["execute_scheduled_payment<br/>(gates timing only, never destination/amount)"]
+
+    P["Anyone (permissionless)"] --> P1["apply_adapter_change, apply_recovery,<br/>apply_guardian_freeze, apply_threshold_change,<br/>apply_guardian_removal, finalize_recovery"]
+    P --> P2["extend_*_ttl maintenance, every contract"]
+```
+
+### Transaction reference
+
+**Owner-gated** (`smart_account`):
+
+| Transaction | Effect |
+|---|---|
+| `propose_adapter_change(operation, adapter)` → `apply_adapter_change(operation)` (permissionless, ~1 day later) / `cancel_adapter_change(operation)` | Rewires which adapter handles `transfer`/`split`. Timelocked *only* for a change to an already-configured treasury — the first-ever binding is set at `initialize` via `InitConfig.initial_adapters`, no delay. |
+| `freeze()` | Immediate emergency stop. One-way — no `unfreeze()`; only `apply_recovery` lifts it. |
+| `pause()` / `unpause()` | Halts/resumes normal operation without touching authority or funds. |
+| `transfer_ownership(new_owner, live_until_ledger)` → `accept_ownership()` (new owner) | Two-step owner handover. |
+| `renounce_ownership()` | Permanently removes the owner. Irreversible — no entrypoint reinstates one. |
+| `extend_instance_ttl()` | Permissionless, listed here for completeness — see "Anyone" below. |
+
+**Context-rule-signer-gated** (`smart_account`'s own `__check_auth`):
+
+| Transaction | Effect |
+|---|---|
+| `execute_transfer_payment(asset, destination, amount, nonce, expected_policy_version)` | Single-recipient SAC payment, policy-checked, nonce-replay-protected. |
+| `execute_split_payment(asset, recipients, amounts, nonce, expected_policy_version)` | One-to-many SAC payment, each recipient independently policy-checked, duplicates rejected. |
+| `create_scheduled_payment(intent)` | Approves a future/recurring payment; `policy_version` and `adapter` are pinned from current state regardless of what the caller supplies. |
+| `cancel_scheduled_payment(intent_id)` | Revokes an approved-but-not-yet-fully-executed schedule. |
+| `add_signer` / `remove_signer` / `add_context_rule` / `remove_context_rule` / `update_context_rule_name` / `update_context_rule_valid_until` / `add_policy` / `remove_policy` | OZ `SmartAccount` trait defaults — full control over the signer/context-rule/policy topology. See the role note above. |
+
+**Guardian-gated** (`recovery_manager`):
+
+| Transaction | Effect |
+|---|---|
+| `request_guardian_freeze(guardian)` | Flags a freeze for `smart_account::apply_guardian_freeze` (permissionless) to pull once. Consumed on read — cannot be replayed. |
+| `open_recovery(caller, request_id, replacement_owner, earliest_ledger)` | Also callable by `recovery_manager`'s admin. Starts a recovery request; `earliest_ledger` must be ≥ `MIN_RECOVERY_DELAY_LEDGERS` out. |
+| `approve_recovery(request_id, guardian)` | Adds this guardian's approval, only counted once `GUARDIAN_ACTIVATION_DELAY_LEDGERS` has passed since that guardian was registered. |
+
+**`recovery_manager` admin-gated:**
+
+| Transaction | Effect |
+|---|---|
+| `add_guardian(guardian)` | Registers immediately; approvals don't count until the activation delay passes. |
+| `propose_remove_guardian(guardian)` → `apply_guardian_removal(guardian)` (permissionless, ~1 day later) / `cancel_guardian_removal(guardian)` | Timelocked removal — a guardian stays fully active until this actually lands. |
+| `propose_threshold_change(new_threshold)` → `apply_threshold_change()` (permissionless, ~1 day later) / `cancel_threshold_change()` | Timelocked guardian-quorum threshold change. |
+| `cancel_recovery(request_id)` | The legitimate admin's safety valve against guardian collusion — deliberately admin-only, unlike opening or approving. |
+
+**`policy_engine` admin-gated:**
+
+| Transaction | Effect |
+|---|---|
+| `set_asset_rule(asset, rule)` | Enable/disable an asset; set its max single-transfer cap. |
+| `set_recipient_allowed(recipient, allowed)` | Destination allowlist. |
+| `set_operation_allowed(operation, allowed)` | Allow/block an operation class (`transfer`, `split`) — fails closed by default, so a newly deployed adapter has no spend authority until explicitly enabled. |
+| `bump_version(next_version)` | The *only* way policy version advances — `set_asset_rule`/`set_recipient_allowed`/`set_operation_allowed` do **not** auto-bump it. Existing approvals pinned to the old version stop validating once this runs. |
+
+**Executor-gated** (reached through `smart_account`, never called on `intent_registry` directly):
+
+| Transaction | Effect |
+|---|---|
+| `execute_scheduled_payment(intent_id, child_sequence)` | Permissionless on `smart_account` itself, but its nested `intent_registry.mark_child_executed` call requires the configured `Executor`'s authorization. |
+
+**Anyone (permissionless):**
+
+| Transaction | Effect |
+|---|---|
+| `account_factory.deploy_account(...)` | Deploys and wires a complete new treasury. |
+| `apply_adapter_change`, `apply_threshold_change`, `apply_guardian_removal`, `apply_recovery`, `apply_guardian_freeze`, `finalize_recovery` | Each "pulls" an already-authorized, already-timelocked-or-quorum-met outcome — see the role list above for why these need no gate of their own. |
+| `extend_instance_ttl()` (every contract), `extend_intent_ttl(...)`, `extend_ttl(...)` (`recovery_manager`) | Storage-archival maintenance — extending TTL creates no authority (`docs/TECHNICAL_ARCHITECTURE.md` §16.1). |
+| `status()`, `is_nonce_used()`, `get_owner()`, `version()`, `is_guardian()`, `request_status()`, `live_approval_count()`, `get_intent()`, `is_child_executed()`, `contract_name()` | Read-only views across every contract. |
+
+### Optional: distributing the owner role itself
+
+Repointing `smart_account`'s `owner` (and, for full coverage, `recovery_manager`'s and `policy_engine`'s admin fields too — same mechanism, no code changes to either) at a deployed `contracts/governance_account` turns every entry in the "Owner-gated", "`recovery_manager` admin-gated", and "`policy_engine` admin-gated" tables above into an N-of-M decision instead of a single key's — using the exact same `AuthPayload` construction a dApp already builds for payments, not a second authorization system (`docs/GOVERNANCE_MULTISIG_DESIGN.md` §7). It is a separate, explicitly-confirmed deployment step, not something `account_factory` does by default, and — as the role note above states — it does not extend to context-rule-signer-gated actions.
 
 ## 13. Security Architecture
 

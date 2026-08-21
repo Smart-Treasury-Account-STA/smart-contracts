@@ -4,7 +4,9 @@
 
 ## 1. Problem, precisely stated
 
-Every owner-gated call on `smart_account` (`propose_adapter_change`, `freeze`, `pause`/`unpause`, `transfer_ownership`) and every admin-gated call on `recovery_manager` (`propose_remove_guardian`, `propose_threshold_change`, `add_guardian`, `cancel_recovery`, …) is authorized by a single `Address` — checked via `ownable::enforce_owner_auth`/`ensure_admin`, which is just `owner.require_auth()` / `admin.require_auth()`. In V1, that `Address` is a single Stellar keypair (a classic account or an `Ed25519`/passkey signer behind it). One compromised key can call any of these.
+Every owner-gated call on `smart_account` (`propose_adapter_change`, `freeze`, `pause`/`unpause`, `transfer_ownership`), every admin-gated call on `recovery_manager` (`propose_remove_guardian`, `propose_threshold_change`, `add_guardian`, `cancel_recovery`, …), and every admin-gated call on `policy_engine` (`set_asset_rule`, `set_recipient_allowed`, `set_operation_allowed`, `bump_version`) is authorized by a single `Address` — checked via `ownable::enforce_owner_auth`/`ensure_admin`, which is just `owner.require_auth()` / `admin.require_auth()`. In V1, that `Address` is a single Stellar keypair (a classic account or an `Ed25519`/passkey signer behind it). One compromised key can call any of these.
+
+**Note (found reviewing this document's own consistency, `docs/TECHNICAL_ARCHITECTURE.md` §12.8):** `policy_engine`'s admin uses the exact same `ensure_admin`/`admin.require_auth()` shape as `recovery_manager`'s — pointing `governance_account` at it works identically, with zero code changes, same as everything else this document describes. It was missing from this paragraph and from §8's "next step" in an earlier version, despite the opening status line above already claiming it as in scope — corrected here and in §8 rather than left as a silent gap between what the document claims and what it actually walks through.
 
 **Correction (found during the strict security review, see `docs/SECURITY_REVIEW_STRICT.md`):** an earlier version of this paragraph also listed `add_context_rule`/`add_signer` here. That was wrong. Those calls, and the rest of the `SmartAccount` trait's own admin surface (`update_context_rule_name`, `update_context_rule_valid_until`, `remove_context_rule`, `remove_signer`, `add_policy`, `remove_policy`), are gated by `e.current_contract_address().require_auth()` — `smart_account`'s *own* signer/context-rule system, completely independent of the `owner` field this document distributes. See §9.
 
@@ -98,7 +100,7 @@ This also means the operational cost flagged in Option A's trade-offs (§3) — 
 
 ## 8. Next step
 
-Deploy one `threshold_policy` instance and one `governance_account` instance to testnet, initialize the latter with a real signer set and threshold, and repoint `smart_account`'s `owner` and `recovery_manager`'s `admin` at it — as an explicit, separately-confirmed action, since it changes how every owner/admin-gated call on the live treasury must be authorized from that point on.
+Deploy one `threshold_policy` instance and one `governance_account` instance to testnet, initialize the latter with a real signer set and threshold, and repoint `smart_account`'s `owner`, `recovery_manager`'s `admin`, **and `policy_engine`'s `admin`** at it — as an explicit, separately-confirmed action, since it changes how every owner/admin-gated call on the live treasury must be authorized from that point on. Leaving `policy_engine`'s admin as a bare keypair while distributing the other two would be a silent gap, not a deliberate scope boundary — nothing about it is harder or different in kind from `recovery_manager`'s admin.
 
 ## 9. Known limitation: this design does not protect signer/context-rule/policy administration
 

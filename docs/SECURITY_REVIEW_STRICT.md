@@ -16,6 +16,7 @@
 | 6 | Medium (design gap, blocking #5) | `intent_registry`'s bootstrap required a hand-built custom-account authorization, impossible for a factory contract (or any external caller) to produce | **Fixed** — `smart_account::initialize` now bootstraps it internally |
 | 7 | Medium | New treasuries had no adapter bound until a ~1 day timelock elapsed, making a freshly deployed account non-functional for a day | **Fixed** — `initial_adapters` |
 | 8 | High | `intent_registry`'s `Executor` silently defaults to the treasury's own address, which the invoker-shortcut satisfies for *any* caller — defeating the documented "relayer key gates when execution happens" property unless a separate call is made | **Fixed** — `initial_executor` |
+| 9 | Low (documentation-consistency) | `docs/GOVERNANCE_MULTISIG_DESIGN.md`'s own opening line claimed `policy_engine`'s admin was in scope for distribution, but §1 and §8 silently never mentioned it, only `recovery_manager`'s | **Fixed** — doc corrected |
 
 ---
 
@@ -99,6 +100,14 @@ This was not assumed — it was verified with a real, precise `mock_auths` test 
 **Fix.** Added `initial_executor: Address` to `smart_account::initialize`, which now calls `intent_registry.set_executor(&initial_executor)` immediately after `intent_registry.initialize(...)`, using the same invoker-shortcut. This forces a deliberate choice at creation time rather than an accidental default; passing the treasury's own address again is still possible and valid (for a deployer who genuinely wants anyone to be able to trigger execution), but it is now a choice, not a side effect of `IntentRegistry`'s generic `initialize(admin)` shape.
 
 Verified with `execute_scheduled_payment_without_executor_authorization_fails` (`contracts/smart_account/src/test.rs`): with an explicit, distinct `initial_executor`, a call with **no** mocked or real authorization at all (`env.set_auths(&[])`) correctly panics — proving the gate is real, not merely present in a doc comment.
+
+## 9. `policy_engine`'s admin was silently missing from the governance-distribution plan (Fixed)
+
+**Finding.** Surfaced while reviewing roles for `docs/TECHNICAL_ARCHITECTURE.md` §12.8 (the new complete role/transaction reference — see below). `docs/GOVERNANCE_MULTISIG_DESIGN.md`'s opening status line claims `governance_account` is "ready to deploy as... the `admin` of `recovery_manager`/`policy_engine`," but §1 ("Problem, precisely stated") and §8 ("Next step") — the sections that actually define the plan — only ever mention `recovery_manager`'s admin. Following §8's "next step" literally would leave `policy_engine`'s admin (`set_asset_rule`, `set_recipient_allowed`, `set_operation_allowed`, `bump_version`) on a bare single keypair even after "distributing the admin/owner role" was declared done, contradicting the document's own opening claim.
+
+**Why this isn't a deliberate scope boundary.** `policy_engine::ensure_admin` is the identical `admin.require_auth()` shape as `recovery_manager`'s — pointing `governance_account` at it costs nothing extra and needs no code change, exactly matching this design's own stated premise ("distributing the owner/admin role does not require touching `contracts/smart_account` or `contracts/recovery_manager` at all," §2). There was no reasoning anywhere in the document for treating it differently; it read as an incomplete enumeration, not a decision.
+
+**Fix.** §1 and §8 of `docs/GOVERNANCE_MULTISIG_DESIGN.md` now include `policy_engine`'s admin alongside `recovery_manager`'s throughout, with a note explaining the correction. `docs/TECHNICAL_ARCHITECTURE.md` §12.8's own "distributing the owner role" paragraph was written consistent with the corrected version from the start.
 
 ## Argument count: `InitConfig` / `SmartAccountInitConfig`
 
