@@ -42,7 +42,7 @@ The smart contract code included in this repository is a working V1 implementati
 
 ## Contract Workspace
 
-Seven Soroban contract packages:
+Ten Soroban contract packages:
 
 | Package | Purpose |
 |---|---|
@@ -53,8 +53,11 @@ Seven Soroban contract packages:
 | `contracts/recovery_manager` | guardian registration, authenticated approval (live-recomputed against current guardian set), ledger-based timelock, permissionless finalization |
 | `contracts/transfer_adapter` | single-recipient SAC transfer, narrowly preauthorized |
 | `contracts/split_adapter` | bounded one-to-many SAC split, narrowly preauthorized, each recipient independently policy-checked |
+| `contracts/threshold_policy` | reusable N-of-M threshold policy contract, attachable to any context rule (treasury or governance) |
+| `contracts/governance_account` | minimal N-of-M multisig, deployable as `smart_account`'s owner or `recovery_manager`/`policy_engine`'s admin instead of a single keypair — see `docs/GOVERNANCE_MULTISIG_DESIGN.md` |
+| `contracts/account_factory` | deploys and wires a complete treasury stack (the six core contracts above) in one call — see `docs/SECURITY_REVIEW_STRICT.md` |
 
-These packages are not the full production contract suite (no `ConditionVerifier`, no delayed governance replacement of pinned module addresses — see `docs/V1_SCOPE.md`), but the core treasury-control logic — policy, scheduling, recovery, and execution — is real and tested against real deployed instances of every module, not mocks.
+These packages are not the full production contract suite (no `ConditionVerifier`, no delayed governance replacement of pinned module addresses, no scoped session keys — see `docs/V1_SCOPE.md`), but the core treasury-control logic — policy, scheduling, recovery, execution, self-service deployment, and governance distribution — is real and tested against real deployed instances of every module, not mocks.
 
 ## Technical Documents
 

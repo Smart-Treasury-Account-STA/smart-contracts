@@ -188,7 +188,7 @@ enum DataKey {
     Guardian(Address),
     PendingGuardianRemoval(Address),
     Request(BytesN<32>),
-    GuardianFreezeRequested,
+    GuardianFreezeEpoch,
 }
 
 #[contracterror]
@@ -214,6 +214,7 @@ pub enum RecoveryManagerError {
     NoPendingGuardianRemoval = 4016,
     NoPendingThresholdChange = 4017,
     GuardianChangeDelayNotElapsed = 4018,
+    GuardianFreezeEpochOverflow = 4019,
 }
 
 #[contractimpl]
@@ -484,9 +485,26 @@ impl RecoveryManager {
     /// stopping active bleeding while recovery is still pending doesn't
     /// need the same bar — the worst case is an unnecessary pause, not a
     /// loss of funds or authority). `smart_account::apply_guardian_freeze`
-    /// pulls this flag the same way `apply_recovery` pulls a finalized
+    /// pulls this epoch the same way `apply_recovery` pulls a finalized
     /// request: permissionlessly, and this contract has no knowledge of, or
     /// dependency on, the treasury that pulls it.
+    ///
+    /// Stores a monotonically increasing epoch rather than a boolean flag.
+    /// Security review finding on an earlier revision of this function: a
+    /// plain `bool`, consumed (cleared) by a permissionless
+    /// `consume_guardian_freeze_request` call, let *any* third party —
+    /// not just the treasury pulling it — call that function directly and
+    /// clear the flag first, silently neutralizing a legitimate guardian's
+    /// freeze request before `smart_account::apply_guardian_freeze` ever
+    /// ran (a front-run/grief with no authorization required at all). A
+    /// monotonic epoch closes this without needing recovery_manager to know
+    /// or trust any specific treasury address: incrementing it is
+    /// permissionless-to-observe and cannot be "consumed away" by a third
+    /// party, because nothing here ever decreases or clears it. Replay
+    /// protection instead lives on the *puller's* side — see
+    /// `smart_account::apply_guardian_freeze`, which tracks the last epoch
+    /// it applied locally, exactly like `AppliedRecovery` already does for
+    /// recovery finalization.
     pub fn request_guardian_freeze(
         env: Env,
         guardian: Address,
@@ -496,9 +514,12 @@ impl RecoveryManager {
         if !is_active_guardian(&env, &guardian) {
             return Err(RecoveryManagerError::Unauthorized);
         }
+        let next_epoch = guardian_freeze_epoch(&env)
+            .checked_add(1)
+            .ok_or(RecoveryManagerError::GuardianFreezeEpochOverflow)?;
         env.storage()
             .instance()
-            .set(&DataKey::GuardianFreezeRequested, &true);
+            .set(&DataKey::GuardianFreezeEpoch, &next_epoch);
         GuardianFreezeRequested {
             guardian: guardian.clone(),
         }
@@ -506,38 +527,14 @@ impl RecoveryManager {
         Ok(())
     }
 
-    pub fn guardian_freeze_requested(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::GuardianFreezeRequested)
-            .unwrap_or(false)
-    }
-
-    /// Security review finding: `guardian_freeze_requested` alone is a
-    /// read-only check against a flag that, before this function existed,
-    /// was set once by `request_guardian_freeze` and never cleared —
-    /// meaning `smart_account::apply_guardian_freeze` (deliberately
-    /// permissionless, matching `apply_recovery`'s "pull an
-    /// already-authorized fact" pattern) could be called again at any
-    /// point in the future, by anyone, and would keep succeeding, even
-    /// long after the original incident was fully resolved through a
-    /// completed recovery. `apply_recovery` already guards against this
-    /// exact class of problem with a request-keyed `AppliedRecovery`
-    /// replay guard; this flag had no equivalent. Consuming it atomically
-    /// here — check and clear in one call, not a separate read then a
-    /// separate write — closes the same gap for guardian-triggered freeze
-    /// that `AppliedRecovery` already closes for recovery finalization,
-    /// and avoids a TOCTOU window between checking and clearing.
-    /// Permissionless, like the read it replaces for this purpose:
-    /// clearing an already-consumed authorization creates no new
-    /// authority.
-    pub fn consume_guardian_freeze_request(env: Env) -> bool {
-        let key = DataKey::GuardianFreezeRequested;
-        let requested = env.storage().instance().get(&key).unwrap_or(false);
-        if requested {
-            env.storage().instance().remove(&key);
-        }
-        requested
+    /// Permissionless view of the current freeze epoch — see
+    /// `request_guardian_freeze`'s doc comment for why this is a monotonic
+    /// counter rather than a consumable flag. `smart_account::
+    /// apply_guardian_freeze` compares this against the last epoch it
+    /// applied to decide whether there is a genuinely new, not-yet-applied
+    /// freeze request.
+    pub fn guardian_freeze_epoch(env: Env) -> u32 {
+        guardian_freeze_epoch(&env)
     }
 
     /// Opens a recovery request. Callable by `admin`/owner **or by any
@@ -737,7 +734,7 @@ fn ensure_initialized(env: &Env) -> Result<(), RecoveryManagerError> {
     if env.storage().instance().has(&DataKey::Initialized) {
         // Instance storage holds this contract's own singleton config
         // (`Initialized`/`Admin`/`GuardianThreshold`/
-        // `PendingGuardianThreshold`/`GuardianFreezeRequested`) and shares a
+        // `PendingGuardianThreshold`/`GuardianFreezeEpoch`) and shares a
         // single TTL across all of it; refreshing here on every call that
         // reaches this far covers every entrypoint uniformly, matching
         // `smart_account`'s own `ensure_initialized`.
@@ -766,6 +763,13 @@ fn guardian_threshold(env: &Env) -> u32 {
         .instance()
         .get(&DataKey::GuardianThreshold)
         .unwrap_or(1)
+}
+
+fn guardian_freeze_epoch(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::GuardianFreezeEpoch)
+        .unwrap_or(0)
 }
 
 fn live_approval_count(env: &Env, request: &RecoveryRequest) -> u32 {
@@ -1539,43 +1543,40 @@ mod tests {
     }
 
     #[test]
-    fn active_guardian_can_request_freeze_and_it_is_visible() {
+    fn active_guardian_can_request_freeze_and_epoch_advances() {
         let (env, client, _admin) = setup();
         let guardian = Address::generate(&env);
         client.add_guardian(&guardian);
         set_ledger(&env, GUARDIAN_ACTIVATION_DELAY_LEDGERS);
 
-        assert!(!client.guardian_freeze_requested());
+        assert_eq!(client.guardian_freeze_epoch(), 0);
         client.request_guardian_freeze(&guardian);
-        assert!(client.guardian_freeze_requested());
+        assert_eq!(client.guardian_freeze_epoch(), 1);
     }
 
-    /// Security review finding: `guardian_freeze_requested` alone never
-    /// cleared the flag it read, so a caller relying only on that getter
-    /// (as `smart_account::apply_guardian_freeze` used to) could act on an
-    /// already-stale request indefinitely. `consume_guardian_freeze_request`
-    /// must check and clear atomically: true exactly once, false after
-    /// that, with no separate request in between.
+    /// Security review finding on an earlier revision: a consumable boolean
+    /// flag let any third party call the consuming function directly and
+    /// clear it before the treasury's own pull ever ran — a front-run/grief
+    /// requiring no authorization at all. The monotonic epoch here is
+    /// permissionless to *read* but nothing ever decreases or clears it, so
+    /// there is nothing for a third party to grief: two separate freeze
+    /// requests genuinely advance the epoch twice, visible to any reader at
+    /// any time, with no consume/clear step on this contract's side at all.
     #[test]
-    fn consume_guardian_freeze_request_clears_it_exactly_once() {
+    fn guardian_freeze_epoch_advances_once_per_request_and_is_never_cleared() {
         let (env, client, _admin) = setup();
         let guardian = Address::generate(&env);
         client.add_guardian(&guardian);
         set_ledger(&env, GUARDIAN_ACTIVATION_DELAY_LEDGERS);
+
         client.request_guardian_freeze(&guardian);
+        assert_eq!(client.guardian_freeze_epoch(), 1);
+        // Reading the epoch — from any caller, with no authorization at all
+        // — cannot clear or otherwise disturb it.
+        assert_eq!(client.guardian_freeze_epoch(), 1);
 
-        assert!(client.consume_guardian_freeze_request());
-        assert!(!client.guardian_freeze_requested());
-        assert!(!client.consume_guardian_freeze_request());
-    }
-
-    /// Consuming with nothing pending is a safe no-op, not an error --
-    /// mirrors `guardian_freeze_requested()`'s own `unwrap_or(false)`
-    /// default rather than panicking on absent state.
-    #[test]
-    fn consume_guardian_freeze_request_with_nothing_pending_returns_false() {
-        let (_env, client, _admin) = setup();
-        assert!(!client.consume_guardian_freeze_request());
+        client.request_guardian_freeze(&guardian);
+        assert_eq!(client.guardian_freeze_epoch(), 2);
     }
 
     #[test]

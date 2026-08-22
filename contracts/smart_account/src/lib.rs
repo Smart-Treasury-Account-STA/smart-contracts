@@ -44,9 +44,8 @@ use soroban_sdk::{
 };
 use stellar_access::ownable::{self, Ownable as OzOwnable};
 use stellar_accounts::smart_account::{
-    add_context_rule, do_check_auth, AuthPayload, ContextRule, ContextRuleType,
-    ExecutionEntryPoint, Signer, SmartAccount as OzSmartAccountTrait,
-    SmartAccountError as OzSmartAccountError,
+    add_context_rule, do_check_auth, AuthPayload, ContextRule, ContextRuleType, Signer,
+    SmartAccount as OzSmartAccountTrait, SmartAccountError as OzSmartAccountError,
 };
 use stellar_contract_utils::pausable::{self, Pausable as OzPausable};
 
@@ -98,7 +97,7 @@ pub struct RecoveryRequestView {
 #[allow(unused)]
 trait RecoveryManagerInterface {
     fn request_status(env: Env, request_id: BytesN<32>) -> RecoveryRequestView;
-    fn consume_guardian_freeze_request(env: Env) -> bool;
+    fn guardian_freeze_epoch(env: Env) -> u32;
 }
 
 #[contractclient(name = "PolicyEngineClient")]
@@ -226,6 +225,7 @@ enum DataKey {
     PendingAdapter(Symbol),
     UsedNonce(u64),
     AppliedRecovery(BytesN<32>),
+    LastAppliedGuardianFreezeEpoch,
 }
 
 #[contracterror]
@@ -550,25 +550,43 @@ impl SmartAccountTreasury {
     /// this contract's own terms, with `recovery_manager` carrying no
     /// knowledge of or dependency on this treasury.
     ///
-    /// Security review finding: this used to call `recovery_manager`'s
-    /// read-only `guardian_freeze_requested`, which checks a flag that is
-    /// set once and, without this fix, never cleared. Since this
-    /// entrypoint is deliberately permissionless (matching
-    /// `apply_recovery`'s "pull an already-authorized fact" pattern), that
-    /// meant anyone could re-freeze the treasury at any future point —
-    /// even long after a full recovery had resolved the original
-    /// incident — simply because a stale flag from months earlier was
-    /// still sitting in `recovery_manager`'s storage. `apply_recovery`
-    /// already guards against exactly this class of problem with a
-    /// request-keyed `AppliedRecovery` replay guard; this now gets the
-    /// same guarantee by calling `consume_guardian_freeze_request`
-    /// (check-and-clear in one call) instead of the passive read.
+    /// Security review finding, twice over. First revision: this called
+    /// `recovery_manager`'s read-only `guardian_freeze_requested`, a flag
+    /// set once and never cleared — since this entrypoint is deliberately
+    /// permissionless (matching `apply_recovery`'s "pull an
+    /// already-authorized fact" pattern), anyone could re-freeze the
+    /// treasury at any future point, even long after a full recovery had
+    /// resolved the original incident, off a stale flag from months
+    /// earlier. That was fixed by making the read *consume* (clear) the
+    /// flag — which introduced a second, worse problem: a *public*,
+    /// unauthenticated `consume_guardian_freeze_request` on
+    /// `recovery_manager` meant any third party — not just this
+    /// contract — could call it directly and clear a legitimate guardian's
+    /// freeze request before this entrypoint ever ran, a front-run/grief
+    /// requiring no authorization at all.
+    ///
+    /// Both are closed together the same way `apply_recovery` already
+    /// handles this class of problem for recovery finalization:
+    /// `recovery_manager` now exposes a monotonically increasing,
+    /// never-cleared `guardian_freeze_epoch` (nothing to grief — reading it
+    /// cannot disturb it), and replay protection lives *here*, locally,
+    /// keyed by that epoch number rather than a shared consumable flag.
     pub fn apply_guardian_freeze(env: Env) -> Result<(), SmartAccountTreasuryError> {
         ensure_initialized(&env)?;
         let recovery_manager = recovery_manager_address(&env)?;
-        if !RecoveryManagerClient::new(&env, &recovery_manager).consume_guardian_freeze_request() {
+        let current_epoch =
+            RecoveryManagerClient::new(&env, &recovery_manager).guardian_freeze_epoch();
+        let last_applied_epoch: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastAppliedGuardianFreezeEpoch)
+            .unwrap_or(0);
+        if current_epoch <= last_applied_epoch {
             return Err(SmartAccountTreasuryError::GuardianFreezeNotRequested);
         }
+        env.storage()
+            .instance()
+            .set(&DataKey::LastAppliedGuardianFreezeEpoch, &current_epoch);
         env.storage().instance().set(&DataKey::Frozen, &true);
         Frozen {
             triggered_by_guardian: true,
@@ -907,8 +925,20 @@ trait IntentRegistryInterface {
 #[contractimpl(contracttrait)]
 impl OzSmartAccountTrait for SmartAccountTreasury {}
 
-#[contractimpl(contracttrait)]
-impl ExecutionEntryPoint for SmartAccountTreasury {}
+// `ExecutionEntryPoint` is deliberately NOT composed here. Security review
+// finding: OZ's default `execute(target, target_fn, target_args)` is a
+// generic "call any function on any contract with any arguments" passthrough
+// gated only by `e.current_contract_address().require_auth()` — the same
+// self-auth gate every other entrypoint uses, satisfied by any signer set
+// that satisfies any valid context rule. Composing it would let any such
+// signer call the configured SAC's own `transfer` directly, bypassing
+// `execute_transfer_payment`'s nonce replay guard, `policy_engine`'s
+// asset/recipient/amount checks, `transfer_adapter`'s narrow preauthorization,
+// and — since OZ's default checks neither `paused` nor `frozen` — even
+// operate while the treasury is paused or frozen. This is exactly what
+// `docs/TECHNICAL_ARCHITECTURE.md` §2.2 rules out by name ("no arbitrary
+// contract execution in v1"); nothing in this codebase calls `.execute()`,
+// so there is no functionality lost by leaving it uncomposed.
 
 #[contractimpl(contracttrait)]
 impl OzOwnable for SmartAccountTreasury {}

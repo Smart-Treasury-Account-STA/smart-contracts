@@ -125,14 +125,35 @@ impl GovernanceAccount {
     /// the very first one is registered. Mirrors
     /// `smart_account::initialize`'s identical bootstrapping problem and
     /// solution exactly.
+    ///
+    /// `caller` is required and must authorize this specific call.
+    /// Security review finding on an earlier revision: this function took
+    /// no address and required no authorization at all — the deploy step
+    /// (`env.register`/`deploy_v2`) only fixes the contract's *address*,
+    /// not who is allowed to call `initialize` on it, so anyone who saw a
+    /// freshly deployed, not-yet-initialized instance could call
+    /// `initialize` themselves with signers of their own choosing, with
+    /// zero cryptographic commitment from any of them. Requiring
+    /// `caller.require_auth()` matches every other contract's
+    /// `initialize(admin, ...)` shape in this workspace and ensures *some*
+    /// real key signs off on this bootstrap. It does not, by itself, fully
+    /// close front-running in a deploy-then-separately-initialize flow — an
+    /// attacker can still race in with *their own* address as `caller` —
+    /// full protection needs deploy and initialize to be atomic, the way
+    /// `contracts/account_factory` already guarantees for the six
+    /// contracts it deploys. Deploying a `governance_account` outside that
+    /// factory should submit deployment and `initialize` in the same
+    /// transaction.
     pub fn initialize(
         env: Env,
+        caller: Address,
         initial_signers: Vec<Signer>,
         initial_policies: Map<Address, Val>,
     ) -> Result<(), GovernanceAccountError> {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(GovernanceAccountError::AlreadyInitialized);
         }
+        caller.require_auth();
 
         add_context_rule(
             &env,

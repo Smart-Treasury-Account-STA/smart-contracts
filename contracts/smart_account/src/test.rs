@@ -691,10 +691,19 @@ fn unpause_rejects_caller_that_does_not_match_owner() {
 }
 
 /// Governance entrypoints below come from unmodified OZ trait defaults
-/// (`SmartAccount`, `Ownable`, `ExecutionEntryPoint`) composed via
+/// (`SmartAccount`, `Ownable`) composed via
 /// `#[contractimpl(contracttrait)] impl X for SmartAccountTreasury {}` —
 /// exercising them here proves the composition is wired correctly on this
 /// specific contract, not re-testing OZ's own already-tested logic.
+/// `ExecutionEntryPoint` is deliberately not composed (see the doc comment
+/// where the OZ trait composition block is declared in `lib.rs`) — its
+/// generic `execute(target, target_fn, target_args)` would let any signer
+/// call any function on any contract, bypassing every payment-specific
+/// safeguard (nonce replay, policy checks, adapter allowlisting, pause/
+/// freeze). Its absence is a compile-time guarantee, not something a
+/// runtime test can meaningfully assert: `SmartAccountTreasuryClient` has
+/// no `.execute()` method at all, so any code that tried to call it simply
+/// wouldn't build.
 #[test]
 fn get_owner_reflects_the_configured_owner() {
     let h = setup();
@@ -737,29 +746,6 @@ fn add_context_rule_and_signer_persist_through_the_composed_registry() {
     h.smart_account.remove_signer(&rule.id, &signer_id);
     let after_removal = h.smart_account.get_context_rule(&rule.id);
     assert_eq!(after_removal.signers.len(), 1);
-}
-
-/// `ExecutionEntryPoint::execute` is a generic passthrough OZ provides for
-/// calling arbitrary contracts as the treasury itself — proves it actually
-/// dispatches, by driving a real state change (`policy_engine`'s version
-/// counter) through it and observing the effect on the target contract.
-#[test]
-fn execution_entry_point_dispatches_to_a_target_contract() {
-    let h = setup();
-    assert_eq!(h.policy_engine.version(), 1);
-
-    // owner.require_auth() inside policy_engine's admin check fires as a
-    // nested call (smart_account.execute -> policy_engine.bump_version ->
-    // owner.require_auth()), not at the transaction root — same non-root
-    // auth situation as the scheduled-payment test above.
-    h.env.mock_all_auths_allowing_non_root_auth();
-    h.smart_account.execute(
-        &h.policy_engine.address,
-        &Symbol::new(&h.env, "bump_version"),
-        &vec![&h.env, 2u32.into_val(&h.env)],
-    );
-
-    assert_eq!(h.policy_engine.version(), 2);
 }
 
 /// Cross-contract edge case: a policy version bump between intent creation
@@ -1201,6 +1187,38 @@ fn guardian_can_independently_freeze_the_treasury() {
     assert!(blocked.is_err());
 }
 
+/// Security review finding on an earlier revision: `recovery_manager`
+/// exposed a public `consume_guardian_freeze_request` with no
+/// authorization at all, so any third party — not just this contract —
+/// could call it directly and clear a guardian's freeze request before
+/// `apply_guardian_freeze` ever ran, a front-run/grief. That function is
+/// gone; `guardian_freeze_epoch` is a plain, permissionless *view* with no
+/// side effects, so a third party reading it (however many times, from
+/// wherever) cannot disturb it. Proven directly: a bystander reads the
+/// epoch first, then the legitimate `apply_guardian_freeze` call still
+/// succeeds exactly as if the read never happened.
+#[test]
+fn a_bystander_reading_the_freeze_epoch_cannot_grief_it() {
+    let h = setup();
+    let guardian = addr(&h.env);
+    h.recovery_manager.add_guardian(&guardian);
+    h.env.ledger().with_mut(|l| l.sequence_number = 17280);
+    h.recovery_manager.request_guardian_freeze(&guardian);
+
+    // A bystander -- not smart_account, not a guardian, not the owner --
+    // reads the epoch. This is a plain view; nothing to authorize, nothing
+    // it could clear.
+    let bystander = addr(&h.env);
+    h.env.set_auths(&[]);
+    let observed_epoch = h.recovery_manager.guardian_freeze_epoch();
+    assert_eq!(observed_epoch, 1);
+    let _ = bystander;
+
+    h.env.mock_all_auths();
+    h.smart_account.apply_guardian_freeze();
+    assert!(h.smart_account.status().frozen);
+}
+
 /// A guardian who never actually requested a freeze cannot have
 /// `apply_guardian_freeze` succeed off of nothing — the pull is gated on
 /// real state from `recovery_manager`, same discipline as `apply_recovery`.
@@ -1217,8 +1235,9 @@ fn apply_guardian_freeze_without_a_request_is_rejected() {
 /// indefinitely, including after a full recovery had already restored
 /// normal operation. This proves the fix: a second call, with no new
 /// `request_guardian_freeze` in between, is rejected exactly like the
-/// "never requested" case above -- the original request is consumed
-/// exactly once, matching `apply_recovery`'s own replay guard.
+/// "never requested" case above -- `recovery_manager`'s freeze epoch hasn't
+/// advanced since the last one this contract applied, tracked locally,
+/// matching `apply_recovery`'s own request-keyed replay guard.
 #[test]
 #[should_panic(expected = "Error(Contract, #8012)")]
 fn apply_guardian_freeze_cannot_replay_an_already_consumed_request() {

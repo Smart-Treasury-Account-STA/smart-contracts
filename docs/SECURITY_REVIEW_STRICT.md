@@ -20,6 +20,12 @@
 | 10 | Low (code quality) | `smart_account`'s `pause`/`unpause` override used a bare string `panic!`, not this contract's own typed error — inconsistent with every other failure path in the file, and an already-defined, already-numbered `Unauthorized` error variant sat unused | **Fixed** |
 | 11 | Low (efficiency/consistency) | `policy_engine`, `intent_registry`, and `recovery_manager` stored small, always-co-accessed singleton config as separate persistent entries with individual TTL bumps, inconsistent with `smart_account`/`governance_account`/`account_factory`'s instance-storage convention for the same kind of data | **Fixed** |
 | 12 | Low (CI/build reproducibility) | No pinned Rust toolchain — CI floated on `@stable` despite its own comments describing a real regression a floating toolchain already caused once | **Fixed** — `rust-toolchain.toml` |
+| 13 | **Critical** | `smart_account` composed OZ's `ExecutionEntryPoint`, a generic "call any function on any contract with any arguments" passthrough gated only by self-auth — bypassing nonce replay, policy checks, adapter allowlisting, and pause/freeze entirely, directly contradicting the stated "no arbitrary contract execution in v1" | **Fixed** — trait no longer composed |
+| 14 | High | `recovery_manager::consume_guardian_freeze_request` was public with no authorization at all, letting any third party front-run and clear a guardian's freeze request before `smart_account` ever pulled it — a grief introduced by the fix for finding 1 above | **Fixed** — replaced with a monotonic, never-cleared epoch counter |
+| 15 | Medium | `governance_account::initialize` took no address and required no authorization at all — anyone could bootstrap a freshly deployed instance with signers of their own choosing | **Fixed** — requires `caller.require_auth()`; residual front-running risk in a non-atomic deploy flow named explicitly |
+| 16 | Medium/Low | `account_factory`'s salt derivation hashed only `base \|\| tag`, not `caller`, despite the doc comment claiming salts were scoped per caller — any two callers submitting the same raw salt would collide | **Fixed** — `caller` folded into the hash |
+| 17 | Low | `stellar contract build` warns that `OzSmartAccountError` (an external crate's error type, used as `__check_auth`'s associated `Error`) is not defined in the exported contract spec, on both `smart_account` and `governance_account` | Confirmed, no fix applied (see rationale below) |
+| 18 | Low (documentation drift) | `README.md` said "seven Soroban contract packages"; the workspace has ten (`threshold_policy`, `governance_account`, `account_factory` were never added to the table) | **Fixed** |
 
 ---
 
@@ -152,6 +158,62 @@ Verified with a new test in each contract (`singleton_config_lives_in_instance_s
 
 Adding `initial_adapters` and `initial_executor` pushed `smart_account::initialize` to 9 parameters, past `clippy::too_many_arguments`'s default limit of 7 — caught by this project's own `-D warnings` CI gate, not silently allowed through. Rather than suppress the lint, the five subordinate-module-wiring parameters (`policy_engine`, `intent_registry`, `recovery_manager`, `initial_adapters`, `initial_executor`) were grouped into a new `InitConfig` struct, bringing `initialize` down to 4 real parameters plus `env`. `contracts/account_factory` mirrors this locally as `SmartAccountInitConfig` (same field names/types — Soroban struct types are decoded structurally, so this needs no crate dependency, matching the rest of that module's client-declaration pattern) rather than depending on `sta-smart-account` directly.
 
+## 13. `smart_account` composed a generic arbitrary-execution passthrough (Fixed — Critical)
+
+**Finding, from an external Soroban review.** `smart_account` composed OZ's `ExecutionEntryPoint` trait unmodified (`#[contractimpl(contracttrait)] impl ExecutionEntryPoint for SmartAccountTreasury {}`). Its default `execute(target, target_fn, target_args)` is:
+
+```rust
+// stellar-accounts-0.7.2/src/smart_account/mod.rs
+fn execute(e: &Env, target: Address, target_fn: Symbol, target_args: Vec<Val>) {
+    e.current_contract_address().require_auth();
+    e.invoke_contract::<Val>(&target, &target_fn, target_args);
+}
+```
+
+— a generic "call any function on any contract with any arguments" passthrough, gated by exactly the same self-auth check every other entrypoint uses (satisfied by any signer set that satisfies any valid context rule). This was directly demonstrated by `execution_entry_point_dispatches_to_a_target_contract` in `test.rs`, which drove a real state change on `policy_engine` through `smart_account.execute(...)`.
+
+**Why this was critical.** It contradicts, by name, `docs/TECHNICAL_ARCHITECTURE.md` §2.2's stated architecture principle: "no arbitrary contract execution in v1." Concretely: any signer satisfying any context rule — even one meant only for a narrow purpose — could call `smart_account.execute(sac_address, "transfer", [smart_account_address, attacker, amount])` directly against the configured treasury's own SAC balance, bypassing `execute_transfer_payment`'s nonce replay guard, `policy_engine`'s asset/recipient/amount/operation checks, and `transfer_adapter`'s narrow preauthorization entirely. OZ's default checks neither `paused` nor `frozen`, so this path also worked on a paused or frozen treasury — the two entrypoints specifically meant to stop movement. This made every other finding and fix in this document, and the ones before it, moot for anyone who found this path: the entire policy/adapter/replay model this project is built around had a complete bypass sitting one call away.
+
+**Fix.** `ExecutionEntryPoint` is no longer composed. Nothing in this codebase ever called `.execute()` for a real purpose (the only caller was the test proving the OZ default works, which existed to document the trait's behavior, not because the product needs it) — so removing it is a pure reduction in attack surface with zero functionality lost, and matches the stated v1 scope exactly rather than requiring a new "strict allowlist" reimplementation of every check `execute_transfer_payment`/`execute_split_payment` already do correctly. Its absence is now a compile-time guarantee: `SmartAccountTreasuryClient` has no `.execute()` method at all.
+
+## 14. Guardian-freeze consumption was a public, unauthenticated grief vector (Fixed — High)
+
+**Finding, from an external Soroban review.** Finding 1 (above) fixed a replay bug by making `recovery_manager::consume_guardian_freeze_request` check-and-clear a boolean flag atomically. That function had — and, before this fix, still has — no `require_auth()` of any kind: it is a fully public function. Any third party, not just `smart_account` pulling its own state, could call `recovery_manager.consume_guardian_freeze_request()` directly. A griefer watching for a pending `apply_guardian_freeze` transaction could front-run it with a direct call to the consuming function, clearing the flag first — so the legitimate `apply_guardian_freeze()` call would then fail with `GuardianFreezeNotRequested`, silently neutralizing a guardian's freeze request with no authorization required at all. This is a serious property to lose precisely in the scenario guardian-freeze exists for: an attacker who has already compromised a signer key benefits directly from being able to race away any guardian's attempt to freeze the treasury.
+
+**Why the obvious "restrict who can call it" fix doesn't fit this design.** `recovery_manager` deliberately carries "zero knowledge of, or trust dependency on, the treasury it protects" (see this file's own module doc comment) — it doesn't store a `smart_account` address to check `require_auth()` against, and adding one would reverse a deliberate decoupling decision for one narrow function.
+
+**Fix.** Replaced the consumable boolean with a monotonically increasing `guardian_freeze_epoch: u32`, incremented (never decreased or cleared) by `request_guardian_freeze`, exposed only as a plain, permissionless *view* (`guardian_freeze_epoch()`) with no side effects — there is nothing left for a third party to grief, since reading a monotonic counter cannot disturb it. Replay protection moved to the *puller's* side: `smart_account::apply_guardian_freeze` now tracks the last epoch it applied locally (`DataKey::LastAppliedGuardianFreezeEpoch`, instance storage) and only proceeds if `recovery_manager`'s current epoch is strictly greater — exactly mirroring how `apply_recovery`'s own `AppliedRecovery(request_id)` guard already works. Verified with `a_bystander_reading_the_freeze_epoch_cannot_grief_it` (`smart_account/src/test.rs`): a bystander reads the epoch first, with zero authorization, and the legitimate `apply_guardian_freeze` call still succeeds immediately afterward exactly as if the read never happened; and `guardian_freeze_epoch_advances_once_per_request_and_is_never_cleared` (`recovery_manager/src/lib.rs`), proving two genuinely separate requests advance the epoch twice and a bare read never moves it.
+
+## 15. `governance_account::initialize` had no authorization at all (Fixed — Medium)
+
+**Finding, from an external Soroban review.** `governance_account::initialize(initial_signers, initial_policies)` took no address parameter and called no `require_auth()` — unlike every other contract in this workspace, whose `initialize(admin, ...)` requires that admin's authorization. Deployment (`env.register`/`deploy_v2`) fixes only the contract's *address*; it does not restrict who may call `initialize` on it afterward. Anyone who observed a freshly deployed, not-yet-initialized `governance_account` instance could call `initialize` themselves, naming signers of their own choosing, with zero cryptographic commitment from any of those signers at all.
+
+**Fix.** Added a required `caller: Address` parameter with `caller.require_auth()`, matching this workspace's own `initialize(admin, ...)` convention elsewhere. **This closes the "bootstrap with arbitrary, uncommitted signers" problem but does not, by itself, fully close front-running** in a deploy-then-separately-initialize flow: an attacker can still race in ahead of the legitimate deployer by supplying *their own* address as `caller`, which they can trivially authorize. Full protection requires deployment and initialization to be atomic — exactly the guarantee `contracts/account_factory` already provides for the six contracts it deploys (one function call, one transaction, no gap for a second transaction to land in between). This residual risk is named explicitly in the function's own doc comment and in `docs/GOVERNANCE_MULTISIG_DESIGN.md`, with the concrete mitigation (deploy `governance_account` and call `initialize` in the same transaction) rather than left implicit.
+
+## 16. `account_factory`'s deployment salts were global, not per-caller (Fixed — Medium/Low)
+
+**Finding, from an external Soroban review.** `deploy_account`'s own doc comment claimed "`salt` only needs to be unique per `caller`," but `sub_salt(env, base, tag)` hashed only `base || tag` — no dependence on `caller` at all. Since every deployment goes through the one factory contract, `env.deployer().with_current_contract(salt)` derives each sub-contract's address from `(factory's own fixed address, salt)` alone, meaning the resulting addresses actually depended only on the raw salt value, contradicting the doc comment. Two different callers submitting the identical raw salt — by coincidence, or an attacker deliberately front-running a visible pending `deploy_account` call to squat that salt first — would collide; whichever one landed second would fail.
+
+**Fix.** `sub_salt` now hashes `caller.to_xdr(env) || base || tag`, so every deployed address is scoped to the specific caller that requested it. Verified with `deploy_account_with_the_same_salt_for_different_callers_does_not_collide` (`account_factory/src/test.rs`): two distinct callers using the exact same raw salt value both succeed, with six distinct addresses apiece. `deploy_account_with_a_reused_salt_for_the_same_caller_fails` (already existing coverage) continues to prove same-caller reuse still correctly collides with itself.
+
+## 17. `OzSmartAccountError` is not defined in the exported contract spec (Confirmed, no fix applied — Low)
+
+**Finding, from an external Soroban review.** `stellar contract build` emits, for both `smart_account` and `governance_account`:
+
+```
+⚠️  type 'OzSmartAccountError' referenced by function '__check_auth' output is not defined in the spec
+```
+
+**Verified accurate.** Both contracts implement `CustomAccountInterface` with `type Error = stellar_accounts::smart_account::SmartAccountError` (aliased `OzSmartAccountError` locally) — a type defined in the external `stellar-accounts` crate, not this workspace. Soroban's spec-generation macros only emit spec entries for `#[contracterror]`/`#[contracttype]` definitions in the crate currently being compiled; they cannot see that a type from a dependency needs its own spec entry, so the generated spec references the type by name with no accompanying definition.
+
+**Why no fix was applied this pass.** A real fix exists — define a local `#[contracterror]` enum mirroring `OzSmartAccountError`'s variants/codes, and have `__check_auth` convert into it before returning — but that means duplicating and keeping in lockstep an external crate's error shape across two contracts, solely to complete client-tooling metadata. This affects only auto-generated SDK/client error *typing* (a caller still gets the correct numeric error and the call still correctly fails); it does not affect on-chain behavior, correctness, or security in any way. Given the effort-to-risk ratio — real but nontrivial code change, for a cosmetic gap with no functional or security impact — this is recorded as a confirmed, known limitation rather than acted on. Revisit if a generated TypeScript/JS SDK actually needs typed `__check_auth` errors.
+
+## 18. `README.md` undercounted the contract workspace (Fixed — Low)
+
+**Finding, from an external Soroban review.** `README.md` said "Seven Soroban contract packages" and listed only the original seven; `Cargo.toml`'s `[workspace] members` has ten. `threshold_policy`, `governance_account`, and `account_factory` — all added this cycle — were never added to the README's table.
+
+**Fix.** Updated to "Ten Soroban contract packages" with all three added to the table, and the closing paragraph updated to mention self-service deployment and governance distribution alongside the original four capabilities.
+
 ---
 
 ## Verification
@@ -159,7 +221,7 @@ Adding `initial_adapters` and `initial_executor` pushed `smart_account::initiali
 All fixes above were run through the project's standard verification trio after landing:
 
 - `cargo build --workspace` — clean.
-- `cargo test --workspace` — 153 unit tests passing (137 before this document's first pass, 139 after findings 1–4, 150 after findings 5–8 and the new `sta-account-factory` package, 153 after finding 11's storage migration added one verifying test per contract), 0 failed.
+- `cargo test --workspace` — 154 unit tests passing (137 before this document's first pass, 139 after findings 1–4, 150 after findings 5–8 and the new `sta-account-factory` package, 153 after finding 11's storage migration added one verifying test per contract, 154 after findings 13–16's fixes and their proof tests — net +1 despite five tests changing behavior, since finding 13 removed one obsolete test and findings 14–16 added new ones), 0 failed.
 - `cargo clippy --workspace --all-targets -- -D warnings` — clean (this pass's parameter-count growth on `smart_account::initialize` tripped `clippy::too_many_arguments`; see "Argument count" above for the fix, not a suppression).
 - `cargo fmt --all -- --check` — clean.
 

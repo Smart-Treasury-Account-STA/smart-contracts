@@ -69,8 +69,8 @@
 //! not a special chicken-and-egg problem like `intent_registry`'s.
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address,
-    Bytes, BytesN, Env, Map, Symbol, Val, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, xdr::ToXdr,
+    Address, Bytes, BytesN, Env, Map, Symbol, Val, Vec,
 };
 use stellar_accounts::smart_account::Signer;
 
@@ -204,9 +204,12 @@ impl AccountFactory {
     /// `intent_registry` already initialized).
     ///
     /// `salt` only needs to be unique per `caller` — sub-contract addresses
-    /// are derived from `sha256(salt || per-contract tag)`, so one caller
-    /// -chosen salt is enough to place all six deployments deterministically
-    /// and collision-free against each other.
+    /// are derived from `sha256(caller || salt || per-contract tag)`, so one
+    /// caller-chosen salt is enough to place all six deployments
+    /// deterministically and collision-free against each other, and two
+    /// different callers can safely choose the identical raw salt value
+    /// with no cross-caller collision or squatting risk (see `sub_salt`'s
+    /// doc comment for the security review finding this closed).
     ///
     /// `executor` is `intent_registry`'s scheduled-payment relayer address
     /// (see `smart_account::initialize`'s doc comment on `initial_executor`
@@ -228,31 +231,47 @@ impl AccountFactory {
             .get(&DataKey::WasmHashes)
             .ok_or(AccountFactoryError::NotInitialized)?;
 
-        let policy_engine = deploy(&env, &sub_salt(&env, &salt, "pol"), &hashes.policy_engine);
+        let policy_engine = deploy(
+            &env,
+            &sub_salt(&env, &caller, &salt, "pol"),
+            &hashes.policy_engine,
+        );
         PolicyEngineClient::new(&env, &policy_engine).initialize(&caller);
 
-        let intent_registry = deploy(&env, &sub_salt(&env, &salt, "int"), &hashes.intent_registry);
+        let intent_registry = deploy(
+            &env,
+            &sub_salt(&env, &caller, &salt, "int"),
+            &hashes.intent_registry,
+        );
         // Left uninitialized: `smart_account::initialize` (below)
         // initializes it directly via the invoker-shortcut.
 
         let recovery_manager = deploy(
             &env,
-            &sub_salt(&env, &salt, "rec"),
+            &sub_salt(&env, &caller, &salt, "rec"),
             &hashes.recovery_manager,
         );
         RecoveryManagerClient::new(&env, &recovery_manager)
             .initialize(&caller, &guardian_threshold);
 
-        let smart_account = deploy(&env, &sub_salt(&env, &salt, "acc"), &hashes.smart_account);
+        let smart_account = deploy(
+            &env,
+            &sub_salt(&env, &caller, &salt, "acc"),
+            &hashes.smart_account,
+        );
 
         let transfer_adapter = deploy(
             &env,
-            &sub_salt(&env, &salt, "xfer"),
+            &sub_salt(&env, &caller, &salt, "xfer"),
             &hashes.transfer_adapter,
         );
         TransferAdapterClient::new(&env, &transfer_adapter).initialize(&caller, &smart_account);
 
-        let split_adapter = deploy(&env, &sub_salt(&env, &salt, "splt"), &hashes.split_adapter);
+        let split_adapter = deploy(
+            &env,
+            &sub_salt(&env, &caller, &salt, "splt"),
+            &hashes.split_adapter,
+        );
         SplitAdapterClient::new(&env, &split_adapter).initialize(&caller, &smart_account);
 
         let mut initial_adapters = Map::new(&env);
@@ -296,8 +315,22 @@ fn ensure_admin(env: &Env) -> Result<Address, AccountFactoryError> {
         .ok_or(AccountFactoryError::NotInitialized)
 }
 
-fn sub_salt(env: &Env, base: &BytesN<32>, tag: &str) -> BytesN<32> {
-    let mut bytes = Bytes::from_array(env, &base.to_array());
+/// Security review finding: this used to hash only `base || tag`, with no
+/// dependence on `caller` at all. Since every deployment goes through this
+/// one factory contract, `env.deployer().with_current_contract(salt)`
+/// derives an address from `(factory's own address, salt)` alone — so any
+/// two callers who happened to submit the same raw `salt` (by coincidence,
+/// or an attacker deliberately front-running a visible pending
+/// `deploy_account` call with the same salt to squat it first) would
+/// collide, failing the second submission regardless of which caller it
+/// belonged to. Folding `caller` into the hash scopes every salt to the
+/// caller that supplied it: two different callers can now safely pick the
+/// exact same raw salt with no cross-caller collision, and reusing a salt
+/// still only ever collides with that same caller's own prior deployment
+/// (see `deploy_account_with_a_reused_salt_for_the_same_caller_fails`).
+fn sub_salt(env: &Env, caller: &Address, base: &BytesN<32>, tag: &str) -> BytesN<32> {
+    let mut bytes = caller.clone().to_xdr(env);
+    bytes.append(&Bytes::from_array(env, &base.to_array()));
     bytes.append(&Bytes::from_slice(env, tag.as_bytes()));
     env.crypto().sha256(&bytes).into()
 }

@@ -42,7 +42,7 @@ fn initializes_with_founding_signers_and_reports_status() {
     let s1 = Signer::Delegated(addr(&e));
     let s2 = Signer::Delegated(addr(&e));
 
-    gov.initialize(&vec![&e, s1, s2], &Map::new(&e));
+    gov.initialize(&addr(&e), &vec![&e, s1, s2], &Map::new(&e));
 
     assert!(gov.status());
     let rule = gov.get_context_rule(&0);
@@ -57,10 +57,11 @@ fn double_initialize_is_rejected() {
     e.mock_all_auths();
     let gov = setup(&e);
     let signers = vec![&e, Signer::Delegated(addr(&e))];
+    let caller = addr(&e);
 
-    gov.initialize(&signers, &Map::new(&e));
+    gov.initialize(&caller, &signers, &Map::new(&e));
     let err = gov
-        .try_initialize(&signers, &Map::new(&e))
+        .try_initialize(&caller, &signers, &Map::new(&e))
         .unwrap_err()
         .unwrap();
     assert_eq!(err, GovernanceAccountError::AlreadyInitialized);
@@ -98,7 +99,7 @@ fn initializes_with_a_threshold_policy_installed() {
         SimpleThresholdAccountParams { threshold: 2 }.into_val(&e),
     );
 
-    gov.initialize(&signers, &policies);
+    gov.initialize(&addr(&e), &signers, &policies);
 
     let rule = gov.get_context_rule(&0);
     assert_eq!(rule.policies.len(), 1);
@@ -118,6 +119,7 @@ fn add_and_remove_signer_persist_through_the_composed_registry() {
     e.mock_all_auths();
     let gov = setup(&e);
     gov.initialize(
+        &addr(&e),
         &vec![&e, Signer::Delegated(addr(&e)), Signer::Delegated(addr(&e))],
         &Map::new(&e),
     );
@@ -135,8 +137,28 @@ fn extend_instance_ttl_is_permissionless() {
     let e = Env::default();
     e.mock_all_auths();
     let gov = setup(&e);
-    gov.initialize(&vec![&e, Signer::Delegated(addr(&e))], &Map::new(&e));
+    gov.initialize(
+        &addr(&e),
+        &vec![&e, Signer::Delegated(addr(&e))],
+        &Map::new(&e),
+    );
 
     e.set_auths(&[]);
     gov.extend_instance_ttl();
+}
+
+/// Security review finding on an earlier revision: `initialize` took no
+/// address and required no authorization at all, so anyone could bootstrap
+/// a freshly deployed instance with signers of their own choosing.
+#[test]
+#[should_panic]
+fn initialize_without_caller_authorization_fails() {
+    let e = Env::default();
+    let gov = setup(&e);
+    e.set_auths(&[]);
+    gov.initialize(
+        &addr(&e),
+        &vec![&e, Signer::Delegated(addr(&e))],
+        &Map::new(&e),
+    );
 }

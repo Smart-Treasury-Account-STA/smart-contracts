@@ -119,10 +119,9 @@ fn deploy_account_with_a_reused_salt_for_the_same_caller_fails() {
         &caller,
     );
 
-    // Same caller (irrelevant to address derivation -- salts are scoped to
-    // the *factory's own* address, not per-caller) and same salt: the
-    // second deployment's first `deploy_v2` call collides with an address
-    // that already exists and traps.
+    // Same caller reusing the same salt: the second deployment's first
+    // `deploy_v2` call collides with an address that already exists (from
+    // this same caller's own prior deployment) and traps.
     factory.deploy_account(
         &caller,
         &salt,
@@ -131,6 +130,48 @@ fn deploy_account_with_a_reused_salt_for_the_same_caller_fails() {
         &1,
         &caller,
     );
+}
+
+/// Security review finding on an earlier revision: `sub_salt` hashed only
+/// `base || tag`, with no dependence on `caller` — since every deployment
+/// goes through this one factory contract, that meant salts were global to
+/// the factory, not scoped per caller as the doc comment claimed. Two
+/// different callers choosing the identical raw salt would have collided
+/// (whoever landed second would fail), which is real squatting/griefing
+/// surface, not just an accidental-collision inconvenience. Proves the fix:
+/// two distinct callers using the exact same raw salt value both succeed,
+/// with six distinct addresses apiece.
+#[test]
+fn deploy_account_with_the_same_salt_for_different_callers_does_not_collide() {
+    let (env, factory, _admin) = setup();
+    let salt = soroban_sdk::BytesN::from_array(&env, &[42u8; 32]);
+
+    let caller_a = Address::generate(&env);
+    let deployed_a = factory.deploy_account(
+        &caller_a,
+        &salt,
+        &vec![&env, Signer::Delegated(Address::generate(&env))],
+        &Map::new(&env),
+        &1,
+        &caller_a,
+    );
+
+    let caller_b = Address::generate(&env);
+    let deployed_b = factory.deploy_account(
+        &caller_b,
+        &salt,
+        &vec![&env, Signer::Delegated(Address::generate(&env))],
+        &Map::new(&env),
+        &1,
+        &caller_b,
+    );
+
+    assert_ne!(deployed_a.smart_account, deployed_b.smart_account);
+    assert_ne!(deployed_a.policy_engine, deployed_b.policy_engine);
+    assert_ne!(deployed_a.intent_registry, deployed_b.intent_registry);
+    assert_ne!(deployed_a.recovery_manager, deployed_b.recovery_manager);
+    assert_ne!(deployed_a.transfer_adapter, deployed_b.transfer_adapter);
+    assert_ne!(deployed_a.split_adapter, deployed_b.split_adapter);
 }
 
 #[test]
