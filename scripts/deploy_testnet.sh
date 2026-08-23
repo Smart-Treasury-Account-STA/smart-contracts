@@ -9,7 +9,7 @@
 #
 # What this script does NOT do: it does not exercise any entrypoint gated
 # by the treasury's own signer/policy authorization (`execute_transfer_payment`,
-# `execute_split_payment`, `create_scheduled_payment`, `ExecutionEntryPoint::execute`).
+# `execute_split_payment`, `create_scheduled_payment`).
 # Those require an off-chain client that can construct OpenZeppelin's
 # `AuthPayload` authorization for the composed `SmartAccount` custom account
 # — exactly the wallet/SDK/relayer integration layer that `docs/V1_SCOPE.md`

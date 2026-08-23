@@ -365,9 +365,15 @@ this does not need §5's custom `AuthPayload` machinery at all. The relayer:
 5. Signs the transaction envelope with the relayer's own key and submits
    through the standard `@stellar/stellar-sdk` RPC flow.
 
-`child_sequence` is the relayer's own choice per execution attempt (any
-`u32` not yet used for that `intent_id` — `intent_registry.is_child_executed(intent_id,
-child_sequence)` is a permissionless read to check before submitting). This
+`child_sequence` is the relayer's own choice per execution attempt, but not
+an arbitrary one: sequences are 1-based (`0` is rejected outright with
+`InvalidChildSequence`, #3013), and any not-yet-used value from `1` up is
+otherwise valid *unless* the intent has a cadence configured
+(`interval_ledgers > 0`), in which case `child_sequence` must also be `<=
+max_executions` and its own computed due ledger
+(`start_ledger + interval_ledgers * (child_sequence - 1)`) must have
+arrived — `intent_registry.is_child_executed(intent_id,
+child_sequence)` is a permissionless read to check before submitting. This
 is what gives the "exactly once" guarantee Deliverable 3 describes: a retry
 or duplicate submission with the **same** `child_sequence` is rejected with
 `ChildAlreadyExecuted` (#3009) rather than re-paying, so idempotent retry

@@ -34,6 +34,8 @@
 | 24 | High | Finding 21's guardian-count check alone wasn't the real ceiling on a satisfiable threshold — `approve_recovery` refuses to grow any request past `MAX_APPROVERS` (20) regardless of guardian count, so a threshold above 20 was still accepted with enough guardians registered, but could then never be reached by any request | **Fixed** — `max_satisfiable_threshold` caps every threshold check at `min(guardian_count, MAX_APPROVERS)` |
 | 25 | Medium | Finding 22's cadence fix computed a child's due ledger via `child_sequence.saturating_sub(1)`, which maps `0` and `1` to the same due ledger — since they are distinct replay-guard keys, an executor could mark both as executed immediately, front-loading two payments where the cadence intended one | **Fixed** — `child_sequence == 0` rejected outright; under a cadence schedule, `child_sequence > max_executions` is also rejected |
 | 26 | Low (documentation drift) | `contracts/README.md` and `docs/V1_REVIEW_GUIDE.md` still described `ExecutionEntryPoint::execute` as part of the live `smart_account` surface, and `contracts/README.md`'s own package table/test count hadn't been updated alongside the root `README.md`'s equivalent fix (finding 18) | **Fixed** |
+| 27 | Low (documentation drift) | `docs/DAPP_INTEGRATION_SPEC.md` told relayer integrators `child_sequence` could be "any `u32` not yet used," contradicting findings 22/25's `child_sequence >= 1`, cadence-bounded validation | **Fixed** |
+| 28 | Low (documentation drift) | `docs/TESTNET_DEPLOYMENT.md` §7 and `scripts/deploy_testnet.sh`'s header comment both still listed `ExecutionEntryPoint::execute` among the signer-gated spend entrypoints, the same drift as finding 26 recurring in two files that finding didn't touch | **Fixed** |
 
 ---
 
@@ -261,6 +263,8 @@ Verified with `apply_recovery_replaces_owner_lifts_freeze_and_replaces_signers_e
 
 **Fix.** Removed the stale local `wasm/` directory. Added a CI step, `verify account_factory's WASM fixtures are not stale`, immediately after the existing `stellar contract build` step: it byte-compares each freshly built contract against its corresponding tracked fixture and fails the build (`::error::`) the moment any contract in that set changes without the fixtures being regenerated to match.
 
+**Recurrence, fourth senior review pass.** The local `wasm/` directory reappeared — an unavoidable side effect of running `stellar contract build --optimize --out-dir wasm` locally while verifying findings 24–25, which regenerates it. Removed again. This directory will keep reappearing during local verification work; that is expected churn in an untracked, gitignored path, not a repo defect — the tracked fixtures and the CI check that guards them are what actually matters, and both were reconfirmed in sync.
+
 ## 24. Guardian threshold could still exceed `MAX_APPROVERS` (Fixed — High)
 
 **Finding, from a third senior review pass.** Finding 21's fix rejected a threshold above the current `guardian_count`, but never checked it against `MAX_APPROVERS` (20) — the hard cap `approve_recovery` enforces on any single request's `approvers` list (`if request.approvers.len() >= MAX_APPROVERS { return Err(TooManyApprovers) }`). With 21 or more guardians registered, a threshold of 21 passed the guardian-count check cleanly, since 21 guardians genuinely exist — but `live_approval_count` (recomputed from `approvers`, itself capped at 20 entries) could then never reach 21, permanently disabling `finalize_recovery` for every request under that threshold. The same class of bug as finding 21, reached through a ceiling the earlier fix didn't account for.
@@ -278,6 +282,18 @@ Verified with `apply_recovery_replaces_owner_lifts_freeze_and_replaces_signers_e
 **Finding, from a third senior review pass.** `contracts/README.md` and `docs/V1_REVIEW_GUIDE.md` both still listed `ExecutionEntryPoint::execute` as part of `smart_account`'s live surface, left over from before finding 13 removed it. `contracts/README.md` also hadn't picked up finding 18's package-count/table fix (it separately said "7 packages" and "120 tests," and was missing `threshold_policy`/`governance_account`/`account_factory` from its own contract table — the root `README.md` was fixed, this one was not).
 
 **Fix.** Both docs corrected: `execute` removed from the described surface (with a pointer to finding 13 explaining why), `contracts/README.md`'s table extended with the three newer packages, and its test count/package count updated to the current, actually-verified numbers. The dated testnet-deployment claim ("7 packages... as of 2026-07-23") is a historical fact, not drift — left as-is with a note that later packages and every fix in this document postdate it.
+
+## 27. Relayer-facing docs described `child_sequence` as unbounded (Fixed — Low)
+
+**Finding, from a fourth senior review pass.** `docs/DAPP_INTEGRATION_SPEC.md` told relayer integrators `child_sequence` is "the relayer's own choice per execution attempt (any `u32` not yet used for that `intent_id`)" — accurate before findings 22/25, no longer accurate after: `0` is now rejected outright, and a cadenced intent additionally requires `child_sequence <= max_executions` and its own due ledger to have arrived. A relayer built against the old description would pick `child_sequence = 0` (a natural first choice for anyone used to 0-indexing) and get a rejection the spec gave no reason to expect.
+
+**Fix.** Updated to state the 1-based convention explicitly, the cadence-specific bound, and the due-ledger formula (`start_ledger + interval_ledgers * (child_sequence - 1)`) inline, so a relayer implementation reads the actual current validation rules rather than the pre-cadence behavior.
+
+## 28. Deployment docs/scripts still listed the removed `execute` entrypoint (Fixed — Low)
+
+**Finding, from a fourth senior review pass.** Finding 26 corrected `contracts/README.md` and `docs/V1_REVIEW_GUIDE.md`; the same stale `ExecutionEntryPoint::execute` mention independently existed in two files that finding didn't touch — `docs/TESTNET_DEPLOYMENT.md` §7's list of signer-gated spend entrypoints, and `scripts/deploy_testnet.sh`'s own header comment describing what it deliberately doesn't exercise. Confirms finding 26's fix wasn't exhaustively grepped for every occurrence at the time.
+
+**Fix.** Both corrected, `docs/TESTNET_DEPLOYMENT.md` with a pointer to finding 13 for why. A repository-wide grep for `ExecutionEntryPoint` after this fix turns up only accurate mentions: source-level doc comments explaining the trait is deliberately not composed, this document's own findings, and `docs/GOVERNANCE_MULTISIG_DESIGN.md`'s pre-implementation design sketch (explicitly labeled `// optional`, for a different contract, already superseded by that same document's own "no `ExecutionEntryPoint`" description of what was actually built).
 
 ---
 
