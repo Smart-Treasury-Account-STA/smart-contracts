@@ -15,6 +15,9 @@ The full technical design is documented in `../docs/TECHNICAL_ARCHITECTURE.md` a
 | `recovery_manager` | Guardian records, guardian removal, authenticated guardian approvals (live-recomputed against current guardian registration at finalize time — not a cached counter), threshold and ledger-based timelock checks, permissionless finalization, guardian-initiated `open_recovery` (no admin required) and guardian-initiated emergency freeze request. |
 | `transfer_adapter` | Single-recipient SAC transfer. Requires the configured `smart_account`'s authorization for the exact call before moving any balance. |
 | `split_adapter` | Bounded one-to-many SAC split. Same preauthorization requirement as `transfer_adapter`. |
+| `threshold_policy` | Reusable N-of-M threshold policy, attachable to any context rule (treasury or governance). |
+| `governance_account` | Minimal N-of-M multisig, deployable as `smart_account`'s owner or `recovery_manager`/`policy_engine`'s admin instead of a single keypair. See `../docs/GOVERNANCE_MULTISIG_DESIGN.md`. |
+| `account_factory` | Deploys and wires a complete treasury stack (the six core contracts above) in one call. See `../docs/SECURITY_REVIEW_STRICT.md`. |
 
 ## What's Integrated, Not Built
 
@@ -34,7 +37,7 @@ Run from the repository root:
 cargo test --workspace
 ```
 
-120 tests across all 7 packages. Measure coverage with:
+164 tests across all 10 packages. Measure coverage with:
 
 ```bash
 cargo llvm-cov --workspace --summary-only
@@ -48,10 +51,10 @@ stellar contract build --optimize --out-dir wasm
 
 ## Testnet Deployment
 
-All 7 packages are deployed and wired on Stellar testnet as of 2026-07-23 — real contract addresses, transactions, and an initialized `smart_account` with a founding Ed25519 wallet signer, reflecting every fix through this document's §6 (timelocked entrypoints, `#[contractevent]` migration). Reproduce with:
+All 7 packages that existed at the time are deployed and wired on Stellar testnet as of 2026-07-23 — real contract addresses, transactions, and an initialized `smart_account` with a founding Ed25519 wallet signer, reflecting every fix through this document's §6 (timelocked entrypoints, `#[contractevent]` migration). `threshold_policy`, `governance_account`, and `account_factory`, plus every fix recorded in `../docs/SECURITY_REVIEW_STRICT.md`, postdate this deployment and are not live there — see that document for what changed since. Reproduce with:
 
 ```bash
 ../scripts/deploy_testnet.sh
 ```
 
-See `../docs/TESTNET_DEPLOYMENT.md` for the full contract-address/transaction record. That document also names one specific, deliberate limitation: entrypoints gated by the treasury's own signer authorization (`execute_transfer_payment`, `execute_split_payment`, `create_scheduled_payment`, `ExecutionEntryPoint::execute`) can't be driven by the bare `stellar` CLI, since satisfying them requires constructing OpenZeppelin's `AuthPayload` off-chain — exactly the wallet/SDK/relayer layer this repository doesn't include. Everything gated by plain owner/admin authorization (initialization, `propose_adapter_change`, `add_guardian`, all `policy_engine` configuration) is deployed, wired, and demonstrated live, including a real on-chain rejection of an unapproved recipient and an over-cap amount, using the current timelocked entrypoint names throughout. The prior PoC deployment record (different contract names, `soroban-sdk 22.0.1`, no OZ composition) is archived separately in `../docs/archive/POC_TESTNET_DEPLOYMENT.md` — not part of the current implementation.
+See `../docs/TESTNET_DEPLOYMENT.md` for the full contract-address/transaction record. That document also names one specific, deliberate limitation: entrypoints gated by the treasury's own signer authorization (`execute_transfer_payment`, `execute_split_payment`, `create_scheduled_payment`) can't be driven by the bare `stellar` CLI, since satisfying them requires constructing OpenZeppelin's `AuthPayload` off-chain — exactly the wallet/SDK/relayer layer this repository doesn't include. (`ExecutionEntryPoint::execute`, a generic arbitrary-contract-call passthrough OZ's `SmartAccount` composition offers by default, is deliberately *not* composed on `smart_account` — see `docs/SECURITY_REVIEW_STRICT.md` finding 13 for why.) Everything gated by plain owner/admin authorization (initialization, `propose_adapter_change`, `add_guardian`, all `policy_engine` configuration) is deployed, wired, and demonstrated live, including a real on-chain rejection of an unapproved recipient and an over-cap amount, using the current timelocked entrypoint names throughout. The prior PoC deployment record (different contract names, `soroban-sdk 22.0.1`, no OZ composition) is archived separately in `../docs/archive/POC_TESTNET_DEPLOYMENT.md` — not part of the current implementation.

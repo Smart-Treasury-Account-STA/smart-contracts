@@ -127,6 +127,7 @@ pub enum IntentRegistryError {
     UnauthorizedExecutor = 3010,
     InvalidMaxExecutions = 3011,
     ExecutionLimitReached = 3012,
+    InvalidChildSequence = 3013,
 }
 
 #[contractimpl]
@@ -302,13 +303,37 @@ impl IntentRegistry {
         if intent.execution_count >= intent.max_executions {
             return Err(IntentRegistryError::ExecutionLimitReached);
         }
+        // Security review finding: `child_sequence` is 1-based everywhere
+        // this schedule math is documented (`docs/DAPP_INTEGRATION_SPEC.md`:
+        // `start_ledger + interval_ledgers * (child_sequence - 1)`), but
+        // nothing rejected `0` — and `child_sequence.saturating_sub(1)`
+        // silently treated `0` identically to `1` (both subtract to `0`),
+        // so an executor could mark *both* sequence `0` and sequence `1`
+        // as due at `start_ledger`, since they are distinct replay-guard
+        // keys (`ChildExecution(intent_id, 0)` and `(intent_id, 1)`) —
+        // front-loading two payments where the cadence intended one.
+        // Rejected unconditionally, not just for interval schedules: `0`
+        // was never a valid sequence number under the 1-based convention
+        // either way.
+        if child_sequence == 0 {
+            return Err(IntentRegistryError::InvalidChildSequence);
+        }
         if intent.interval_ledgers > 0 {
+            // A sequence number beyond the approved total is never due,
+            // regardless of ledger time — otherwise `max_executions` only
+            // bounds *how many* children can ever execute, not *which*
+            // sequence numbers are legitimate, letting an executor mark an
+            // arbitrarily-far-future-looking sequence (e.g. 999 against
+            // `max_executions = 3`) the moment its due ledger arrives.
+            if child_sequence > intent.max_executions {
+                return Err(IntentRegistryError::InvalidChildSequence);
+            }
             let due_ledger = intent
                 .start_ledger
                 .checked_add(
                     intent
                         .interval_ledgers
-                        .checked_mul(child_sequence.saturating_sub(1))
+                        .checked_mul(child_sequence - 1)
                         .ok_or(IntentRegistryError::InvalidWindow)?,
                 )
                 .ok_or(IntentRegistryError::InvalidWindow)?;
@@ -721,6 +746,67 @@ mod tests {
         set_ledger(&env, 1100);
         client.mark_child_executed(&intent_id, &2);
         assert_eq!(client.get_intent(&intent_id).execution_count, 2);
+    }
+
+    /// Security review finding on an earlier revision of the cadence fix:
+    /// `child_sequence.saturating_sub(1)` mapped both `0` and `1` to the
+    /// same due ledger (`start_ledger`), and since `0`/`1` are *distinct*
+    /// replay-guard keys, an executor could mark both as executed
+    /// immediately — two payments front-loaded where the cadence intended
+    /// exactly one. Proves `0` is rejected outright, under a cadence
+    /// schedule and under the plain bounded-batch default alike.
+    #[test]
+    fn mark_child_executed_rejects_sequence_zero() {
+        let (env, client, _admin) = setup();
+        let mut cadenced = intent(&env, 63);
+        cadenced.end_ledger = 100_000;
+        cadenced.interval_ledgers = 1000;
+        cadenced.max_executions = 3;
+        let cadenced_id = cadenced.intent_id.clone();
+        client.create_intent(&cadenced);
+
+        set_ledger(&env, cadenced.start_ledger);
+        let err = client.try_mark_child_executed(&cadenced_id, &0);
+        assert_eq!(err, Err(Ok(IntentRegistryError::InvalidChildSequence)));
+
+        // Sequence 1 -- the genuinely first execution -- still works.
+        client.mark_child_executed(&cadenced_id, &1);
+        assert_eq!(client.get_intent(&cadenced_id).execution_count, 1);
+
+        // Not cadence-specific: 0 was never a valid sequence number under
+        // the 1-based convention, even for a plain bounded batch.
+        let mut batch = intent(&env, 64);
+        batch.max_executions = 2;
+        let batch_id = batch.intent_id.clone();
+        client.create_intent(&batch);
+        set_ledger(&env, batch.start_ledger);
+        let batch_err = client.try_mark_child_executed(&batch_id, &0);
+        assert_eq!(
+            batch_err,
+            Err(Ok(IntentRegistryError::InvalidChildSequence))
+        );
+    }
+
+    /// A cadence schedule's sequence numbers are bounded by
+    /// `max_executions`, not just by cumulative usage — otherwise an
+    /// executor could mark an arbitrarily large sequence number (e.g. `999`
+    /// against `max_executions = 3`) the moment ledger time alone made its
+    /// computed due ledger arrive, decoupled from how many executions were
+    /// actually approved.
+    #[test]
+    fn mark_child_executed_rejects_sequence_beyond_max_executions_under_cadence() {
+        let (env, client, _admin) = setup();
+        let mut scheduled = intent(&env, 65);
+        scheduled.start_ledger = 100;
+        scheduled.end_ledger = 100_000_000;
+        scheduled.interval_ledgers = 1000;
+        scheduled.max_executions = 3;
+        let intent_id = scheduled.intent_id.clone();
+        client.create_intent(&scheduled);
+
+        set_ledger(&env, 100_000_000);
+        let err = client.try_mark_child_executed(&intent_id, &999);
+        assert_eq!(err, Err(Ok(IntentRegistryError::InvalidChildSequence)));
     }
 
     /// `interval_ledgers: 0` (the default) is a deliberate opt-out, not a

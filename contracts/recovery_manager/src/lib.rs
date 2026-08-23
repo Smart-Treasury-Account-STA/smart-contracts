@@ -257,6 +257,13 @@ impl RecoveryManager {
         if guardian_threshold == 0 {
             return Err(RecoveryManagerError::InvalidThreshold);
         }
+        // See `max_satisfiable_threshold`'s doc comment: no number of
+        // guardians can ever push `live_approval_count` past
+        // `MAX_APPROVERS`, so this ceiling applies unconditionally, before
+        // any guardian even exists.
+        if guardian_threshold > MAX_APPROVERS {
+            return Err(RecoveryManagerError::ThresholdWouldBecomeUnsatisfiable);
+        }
 
         admin.require_auth();
         env.storage().instance().set(&DataKey::Initialized, &true);
@@ -320,7 +327,12 @@ impl RecoveryManager {
         // guardians that will ever exist, permanently disabling recovery
         // — see `apply_guardian_removal`'s identical check for the mirror
         // case (removing a guardian out from under an existing threshold).
-        if new_threshold > guardian_count(&env) {
+        // `max_satisfiable_threshold` additionally caps this at
+        // `MAX_APPROVERS`: a threshold above it is unreachable no matter
+        // how many guardians are registered, since `approve_recovery`
+        // itself refuses to grow any request's `approvers` list past that
+        // many.
+        if new_threshold > max_satisfiable_threshold(&env) {
             return Err(RecoveryManagerError::ThresholdWouldBecomeUnsatisfiable);
         }
         let effective_ledger = env
@@ -381,7 +393,7 @@ impl RecoveryManager {
         // (a guardian removal applied in between), which could make a
         // threshold that was valid when proposed unsatisfiable by the time
         // it actually lands.
-        if pending.new_threshold > guardian_count(&env) {
+        if pending.new_threshold > max_satisfiable_threshold(&env) {
             return Err(RecoveryManagerError::ThresholdWouldBecomeUnsatisfiable);
         }
         env.storage()
@@ -862,6 +874,19 @@ fn guardian_count(env: &Env) -> u32 {
         .instance()
         .get(&DataKey::GuardianCount)
         .unwrap_or(0)
+}
+
+/// Security review finding: `guardian_count` alone isn't the real ceiling
+/// on a satisfiable threshold — `approve_recovery` rejects once a
+/// request's `approvers` list reaches `MAX_APPROVERS`, so
+/// `live_approval_count` can never exceed that regardless of how many
+/// guardians exist. A threshold above `MAX_APPROVERS` was accepted by the
+/// earlier `guardian_count`-only check as long as enough guardians were
+/// registered, but could then never be reached by any request —
+/// permanently disabling recovery the same way an unregistered-guardian
+/// threshold does.
+fn max_satisfiable_threshold(env: &Env) -> u32 {
+    guardian_count(env).min(MAX_APPROVERS)
 }
 
 fn live_approval_count(env: &Env, request: &RecoveryRequest) -> u32 {
@@ -1639,6 +1664,40 @@ mod tests {
         client.add_guardian(&Address::generate(&env));
 
         let err = client.try_propose_threshold_change(&2);
+        assert_eq!(
+            err,
+            Err(Ok(RecoveryManagerError::ThresholdWouldBecomeUnsatisfiable))
+        );
+    }
+
+    /// Security review finding: `guardian_count` alone isn't the real
+    /// ceiling on a satisfiable threshold — `approve_recovery` refuses to
+    /// grow any request's `approvers` list past `MAX_APPROVERS` regardless
+    /// of how many guardians exist, so a threshold above it was accepted
+    /// (as long as enough guardians were registered) but could then never
+    /// be reached by any request, permanently disabling recovery.
+    #[test]
+    fn initialize_rejects_threshold_above_max_approvers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(RecoveryManager, ());
+        let client = RecoveryManagerClient::new(&env, &contract_id);
+
+        let err = client.try_initialize(&Address::generate(&env), &(MAX_APPROVERS + 1));
+        assert_eq!(
+            err,
+            Err(Ok(RecoveryManagerError::ThresholdWouldBecomeUnsatisfiable))
+        );
+    }
+
+    #[test]
+    fn propose_threshold_change_rejects_threshold_above_max_approvers() {
+        let (env, client, _admin) = setup();
+        for _ in 0..=MAX_APPROVERS {
+            client.add_guardian(&Address::generate(&env));
+        }
+
+        let err = client.try_propose_threshold_change(&(MAX_APPROVERS + 1));
         assert_eq!(
             err,
             Err(Ok(RecoveryManagerError::ThresholdWouldBecomeUnsatisfiable))
