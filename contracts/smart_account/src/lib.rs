@@ -44,8 +44,9 @@ use soroban_sdk::{
 };
 use stellar_access::ownable::{self, Ownable as OzOwnable};
 use stellar_accounts::smart_account::{
-    add_context_rule, do_check_auth, AuthPayload, ContextRule, ContextRuleType, Signer,
-    SmartAccount as OzSmartAccountTrait, SmartAccountError as OzSmartAccountError,
+    add_context_rule, do_check_auth, remove_context_rule, AuthPayload, ContextRule,
+    ContextRuleType, Signer, SmartAccount as OzSmartAccountTrait,
+    SmartAccountError as OzSmartAccountError, SmartAccountStorageKey,
 };
 use stellar_contract_utils::pausable::{self, Pausable as OzPausable};
 
@@ -87,6 +88,8 @@ pub struct InitConfig {
 pub struct RecoveryRequestView {
     pub request_id: BytesN<32>,
     pub replacement_owner: Address,
+    pub replacement_signers: Vec<Signer>,
+    pub replacement_policies: Map<Address, Val>,
     pub earliest_ledger: u32,
     pub approvers: Vec<Address>,
     pub cancelled: bool,
@@ -836,13 +839,35 @@ impl SmartAccountTreasury {
     }
 
     /// Pulls a finalized recovery outcome from the configured
-    /// `recovery_manager` and applies it: force-overwrites ownership to
-    /// the guardian-approved replacement and lifts the freeze. Never
-    /// pushed by `recovery_manager` — this contract decides, on its own
-    /// terms, whether to consume a finalized request, exactly once
-    /// (`AppliedRecovery` replay guard). Permissionless: anyone may call
-    /// this once `recovery_manager` reports the request finalized, mirroring
-    /// `finalize_recovery`'s own permissionless design.
+    /// `recovery_manager` and applies it: force-overwrites ownership,
+    /// replaces the *entire* signer/context-rule topology with the
+    /// guardian-approved replacement, syncs the guardian-freeze epoch, and
+    /// lifts the freeze. Never pushed by `recovery_manager` — this
+    /// contract decides, on its own terms, whether to consume a finalized
+    /// request, exactly once (`AppliedRecovery` replay guard).
+    /// Permissionless: anyone may call this once `recovery_manager`
+    /// reports the request finalized, mirroring `finalize_recovery`'s own
+    /// permissionless design.
+    ///
+    /// Security review finding, two parts. First: this used to overwrite
+    /// only `Ownable`'s `owner`. Spend authority — `execute_transfer_payment`
+    /// and everything else gated by `e.current_contract_address()
+    /// .require_auth()` — is the OZ context-rule/signer registry, a
+    /// completely separate system `owner` never gates (see
+    /// `docs/GOVERNANCE_MULTISIG_DESIGN.md` §9). A compromised *payment
+    /// signer* — the more likely real-world compromise, not the owner key
+    /// — survived recovery entirely. `clear_all_context_rules` plus
+    /// installing the recovery-approved replacement now closes this: see
+    /// that function's doc comment for why every existing rule is removed
+    /// rather than just adding a new one alongside them.
+    ///
+    /// Second: `apply_guardian_freeze` compares `recovery_manager`'s
+    /// current freeze epoch against the last one this contract applied,
+    /// locally. Without syncing that local value here, a freeze epoch
+    /// bumped during (or shortly before) recovery — genuinely unrelated to
+    /// whatever this recovery just resolved — could be applied
+    /// immediately *after* recovery completes, re-freezing a
+    /// just-recovered account off a stale, already-superseded request.
     pub fn apply_recovery(
         env: Env,
         request_id: BytesN<32>,
@@ -854,8 +879,8 @@ impl SmartAccountTreasury {
         }
 
         let recovery_manager = recovery_manager_address(&env)?;
-        let request =
-            RecoveryManagerClient::new(&env, &recovery_manager).request_status(&request_id);
+        let recovery_manager_client = RecoveryManagerClient::new(&env, &recovery_manager);
+        let request = recovery_manager_client.request_status(&request_id);
         if !request.finalized {
             return Err(SmartAccountTreasuryError::RecoveryNotFinalized);
         }
@@ -877,6 +902,21 @@ impl SmartAccountTreasury {
             &ownable::OwnableStorageKey::Owner,
             &request.replacement_owner,
         );
+
+        clear_all_context_rules(&env);
+        install_default_context_rule(
+            &env,
+            "recovered",
+            &request.replacement_signers,
+            &request.replacement_policies,
+        );
+
+        let current_freeze_epoch = recovery_manager_client.guardian_freeze_epoch();
+        env.storage().instance().set(
+            &DataKey::LastAppliedGuardianFreezeEpoch,
+            &current_freeze_epoch,
+        );
+
         env.storage().instance().set(&DataKey::Frozen, &false);
 
         RecoveryApplied {
@@ -899,6 +939,7 @@ pub struct ScheduledIntentArgs {
     pub amount: i128,
     pub start_ledger: u32,
     pub end_ledger: u32,
+    pub interval_ledgers: u32,
     pub max_executions: u32,
     pub execution_count: u32,
     pub policy_version: u32,
@@ -986,19 +1027,57 @@ impl CustomAccountInterface for SmartAccountTreasury {
 // ################## INTERNAL HELPERS ##################
 
 fn add_context_rule_root(env: &Env, signers: &Vec<Signer>, policies: &Map<Address, Val>) {
-    // The flat `add_context_rule` re-export is the raw storage primitive —
-    // unlike the `SmartAccount` trait's own `add_context_rule` entrypoint,
-    // it does not itself call `require_auth()`, which is exactly what makes
-    // it usable here: at `initialize` time there is no signer registered
-    // yet to authorize against.
+    install_default_context_rule(env, "root", signers, policies);
+}
+
+/// The flat `add_context_rule` re-export is the raw storage primitive —
+/// unlike the `SmartAccount` trait's own `add_context_rule` entrypoint, it
+/// does not itself call `require_auth()`. Used both at `initialize` time
+/// (no signer registered yet to authorize against) and at `apply_recovery`
+/// time (the guardian quorum + timelock already verified is the
+/// authorization; requiring the *old*, possibly-compromised signers to
+/// also approve their own replacement would defeat the point).
+fn install_default_context_rule(
+    env: &Env,
+    name: &str,
+    signers: &Vec<Signer>,
+    policies: &Map<Address, Val>,
+) {
     add_context_rule(
         env,
         &ContextRuleType::Default,
-        &String::from_str(env, "root"),
+        &String::from_str(env, name),
         None,
         signers,
         policies,
     );
+}
+
+/// Removes every existing context rule. Security review finding: recovery
+/// used to only ever replace `Ownable`'s `owner`, leaving every previously
+/// registered signer — including a compromised one, the actual scenario
+/// recovery exists for — fully authorized to keep spending immediately
+/// after "recovery" completed. `docs/TECHNICAL_ARCHITECTURE.md` §12.7
+/// already documented the intended behavior ("Old signers and sessions are
+/// cleared. New signers are installed."); this makes it real. Context rule
+/// IDs are assigned by a monotonic counter and never reused (removing one
+/// does not shift the others), so every ID up to `NextId` is checked for
+/// existence rather than assumed contiguous.
+fn clear_all_context_rules(env: &Env) {
+    let next_id: u32 = env
+        .storage()
+        .instance()
+        .get(&SmartAccountStorageKey::NextId)
+        .unwrap_or(0);
+    for id in 0..next_id {
+        if env
+            .storage()
+            .persistent()
+            .has(&SmartAccountStorageKey::ContextRuleData(id))
+        {
+            remove_context_rule(env, id);
+        }
+    }
 }
 
 fn ensure_initialized(env: &Env) -> Result<(), SmartAccountTreasuryError> {

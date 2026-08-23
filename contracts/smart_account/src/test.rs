@@ -430,6 +430,7 @@ fn scheduled_payment_creation_and_relayer_triggered_execution() {
             amount: 250,
             start_ledger: 10,
             end_ledger: 20,
+            interval_ledgers: 0,
             max_executions: 1,
             execution_count: 0,
             // Overwritten by `create_scheduled_payment` with policy_engine's
@@ -488,6 +489,7 @@ fn execute_scheduled_payment_without_executor_authorization_fails() {
             amount: 250,
             start_ledger: 10,
             end_ledger: 20,
+            interval_ledgers: 0,
             max_executions: 1,
             execution_count: 0,
             policy_version: 999,
@@ -525,6 +527,7 @@ fn execute_scheduled_payment_only_ever_uses_the_canonical_intent_data() {
             amount: 250,
             start_ledger: 10,
             end_ledger: 20,
+            interval_ledgers: 0,
             max_executions: 1,
             execution_count: 0,
             policy_version: 0,
@@ -543,14 +546,24 @@ fn execute_scheduled_payment_only_ever_uses_the_canonical_intent_data() {
     assert_eq!(token_client.balance(&other_recipient), 0);
 }
 
+/// Security review finding: recovery used to replace only `Ownable`'s
+/// `owner`, never the context-rule signer registry — day-to-day spend
+/// authority is a completely separate system `owner` doesn't gate at all.
+/// This proves the fix at the data level: the pre-recovery context rule
+/// (whatever `setup()`'s founding signer produced) is gone after recovery
+/// — a fresh rule exists with a *different* ID, carrying exactly the
+/// guardian-approved replacement signer and nothing else.
 #[test]
-fn apply_recovery_replaces_owner_and_lifts_freeze_exactly_once() {
+fn apply_recovery_replaces_owner_lifts_freeze_and_replaces_signers_exactly_once() {
     let h = setup();
     let recipient = addr(&h.env);
     allow_payment(&h, &recipient);
     let new_owner = addr(&h.env);
     let guardian = addr(&h.env);
     let request_id = soroban_sdk::BytesN::from_array(&h.env, &[3u8; 32]);
+
+    let rules_before = h.smart_account.get_context_rules_count();
+    assert_eq!(rules_before, 1);
 
     // Freeze the treasury (e.g. the old owner's signer is suspected
     // compromised) — normal payments now fail, and there is no direct
@@ -564,13 +577,20 @@ fn apply_recovery_replaces_owner_and_lifts_freeze_exactly_once() {
     // Guardian-driven recovery against the *same* recovery_manager
     // smart_account was configured with.
     h.recovery_manager.add_guardian(&guardian);
+    let new_signer = Signer::Delegated(addr(&h.env));
     // recovery_manager enforces a minimum ~1-day delay for both the
     // recovery timelock (MIN_RECOVERY_DELAY_LEDGERS) and newly added
     // guardian activation (GUARDIAN_ACTIVATION_DELAY_LEDGERS) — both 17280
     // ledgers in this build, both counted from ledger 0 here, so a single
     // advance before approving satisfies both.
-    h.recovery_manager
-        .open_recovery(&h.owner, &request_id, &new_owner, &17280);
+    h.recovery_manager.open_recovery(
+        &h.owner,
+        &request_id,
+        &new_owner,
+        &vec![&h.env, new_signer.clone()],
+        &Map::new(&h.env),
+        &17280,
+    );
     h.env.ledger().with_mut(|l| l.sequence_number = 17280);
     h.recovery_manager.approve_recovery(&request_id, &guardian);
     h.recovery_manager.finalize_recovery(&request_id);
@@ -583,6 +603,16 @@ fn apply_recovery_replaces_owner_and_lifts_freeze_exactly_once() {
     assert!(!status.frozen);
     h.smart_account
         .execute_transfer_payment(&h.token, &recipient, &100, &2, &1);
+
+    // Exactly one context rule still exists, but it is a genuinely new one
+    // -- old rule 0 is gone, replaced by a fresh rule carrying only the
+    // recovery-approved signer.
+    assert_eq!(h.smart_account.get_context_rules_count(), 1);
+    let recovered_rule = h.smart_account.get_context_rule(&1);
+    assert_eq!(recovered_rule.signers.len(), 1);
+    assert_eq!(recovered_rule.signers.get(0).unwrap(), new_signer);
+    let old_rule_gone = h.smart_account.try_get_context_rule(&0);
+    assert!(old_rule_gone.is_err());
 
     // Replay guard: applying the same finalized request twice is rejected.
     let replay = h.smart_account.try_apply_recovery(&request_id);
@@ -600,8 +630,14 @@ fn apply_recovery_before_finalization_is_rejected() {
     let request_id = soroban_sdk::BytesN::from_array(&h.env, &[4u8; 32]);
 
     h.recovery_manager.add_guardian(&guardian);
-    h.recovery_manager
-        .open_recovery(&h.owner, &request_id, &new_owner, &17280);
+    h.recovery_manager.open_recovery(
+        &h.owner,
+        &request_id,
+        &new_owner,
+        &vec![&h.env, Signer::Delegated(addr(&h.env))],
+        &Map::new(&h.env),
+        &17280,
+    );
     // No approval yet — threshold is 1, so this alone would suffice, but
     // we never call finalize_recovery at all here.
 
@@ -774,6 +810,7 @@ fn policy_version_bump_after_intent_creation_blocks_execution() {
             amount: 100,
             start_ledger: 10,
             end_ledger: 1000,
+            interval_ledgers: 0,
             max_executions: 1,
             execution_count: 0,
             policy_version: 0,
@@ -810,6 +847,7 @@ fn frozen_treasury_blocks_scheduled_execution() {
             amount: 100,
             start_ledger: 10,
             end_ledger: 1000,
+            interval_ledgers: 0,
             max_executions: 1,
             execution_count: 0,
             policy_version: 0,
@@ -844,6 +882,7 @@ fn cancelled_scheduled_payment_cannot_execute_end_to_end() {
             amount: 100,
             start_ledger: 10,
             end_ledger: 1000,
+            interval_ledgers: 0,
             max_executions: 1,
             execution_count: 0,
             policy_version: 0,
@@ -945,6 +984,7 @@ fn scheduled_payment_uses_the_adapter_pinned_at_approval_not_a_later_reconfigura
             amount: 100,
             start_ledger: 10,
             end_ledger: 20_000,
+            interval_ledgers: 0,
             max_executions: 1,
             execution_count: 0,
             policy_version: 0,
@@ -1013,6 +1053,7 @@ fn creating_a_scheduled_payment_before_an_adapter_is_configured_is_rejected() {
         amount: 100,
         start_ledger: 0,
         end_ledger: 1000,
+        interval_ledgers: 0,
         max_executions: 1,
         execution_count: 0,
         policy_version: 0,

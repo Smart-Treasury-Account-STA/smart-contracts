@@ -31,6 +31,21 @@ pub struct ScheduledIntent {
     pub amount: i128,
     pub start_ledger: u32,
     pub end_ledger: u32,
+    /// Security review finding: `start_ledger`/`end_ledger`/`max_executions`
+    /// alone bound a *total* allowance and its outer window, but nothing
+    /// stopped the executor from consuming every remaining execution the
+    /// moment the window opened — fine for bounded batch execution (the
+    /// case this contract was originally built around), but wrong for a
+    /// genuinely recurring schedule (e.g. "$1,000/month for a year"),
+    /// where the whole point is spreading executions out over time, not
+    /// just capping their count. `0` preserves the original behavior
+    /// exactly (any unused `child_sequence` executable any time in the
+    /// window) — this is opt-in, not a behavior change for existing
+    /// callers. When set, `mark_child_executed` additionally requires
+    /// `child_sequence`'s own due ledger
+    /// (`start_ledger + interval_ledgers * (child_sequence - 1)`) to have
+    /// arrived.
+    pub interval_ledgers: u32,
     /// Total number of child executions this intent may ever authorize.
     /// Bounds recurring automation instead of allowing unlimited replay
     /// within an otherwise-valid execution window.
@@ -175,6 +190,25 @@ impl IntentRegistry {
         if intent.max_executions == 0 {
             return Err(IntentRegistryError::InvalidMaxExecutions);
         }
+        if intent.interval_ledgers > 0 {
+            // The *last* execution's due ledger must still fall inside the
+            // declared window — otherwise the final one or more executions
+            // would be silently unreachable, quietly shrinking the
+            // approved `max_executions` below what the signer actually
+            // authorized at creation time.
+            let last_due_ledger = intent
+                .start_ledger
+                .checked_add(
+                    intent
+                        .interval_ledgers
+                        .checked_mul(intent.max_executions.saturating_sub(1))
+                        .ok_or(IntentRegistryError::InvalidWindow)?,
+                )
+                .ok_or(IntentRegistryError::InvalidWindow)?;
+            if last_due_ledger > intent.end_ledger {
+                return Err(IntentRegistryError::InvalidWindow);
+            }
+        }
 
         let key = DataKey::Intent(intent.intent_id.clone());
         if env.storage().persistent().has(&key) {
@@ -191,6 +225,7 @@ impl IntentRegistry {
             amount: intent.amount,
             start_ledger: intent.start_ledger,
             end_ledger: intent.end_ledger,
+            interval_ledgers: intent.interval_ledgers,
             max_executions: intent.max_executions,
             execution_count: 0,
             policy_version: intent.policy_version,
@@ -266,6 +301,20 @@ impl IntentRegistry {
         }
         if intent.execution_count >= intent.max_executions {
             return Err(IntentRegistryError::ExecutionLimitReached);
+        }
+        if intent.interval_ledgers > 0 {
+            let due_ledger = intent
+                .start_ledger
+                .checked_add(
+                    intent
+                        .interval_ledgers
+                        .checked_mul(child_sequence.saturating_sub(1))
+                        .ok_or(IntentRegistryError::InvalidWindow)?,
+                )
+                .ok_or(IntentRegistryError::InvalidWindow)?;
+            if ledger_sequence < due_ledger {
+                return Err(IntentRegistryError::ExecutionTooEarly);
+            }
         }
 
         let child_key = DataKey::ChildExecution(intent_id.clone(), child_sequence);
@@ -388,6 +437,7 @@ mod tests {
             amount: 100,
             start_ledger: 10,
             end_ledger: 20,
+            interval_ledgers: 0,
             max_executions: 3,
             execution_count: 0,
             policy_version: 1,
@@ -638,6 +688,73 @@ mod tests {
         let mut scheduled = intent(&env, 41);
         scheduled.start_ledger = 20;
         scheduled.end_ledger = 10;
+
+        let err = client.try_create_intent(&scheduled);
+        assert_eq!(err, Err(Ok(IntentRegistryError::InvalidWindow)));
+    }
+
+    /// Security review finding: with no cadence enforcement, an executor
+    /// could consume an entire "recurring" allowance the instant the
+    /// window opened — fine for a bounded batch, wrong for a genuinely
+    /// spaced-out schedule. Proves `interval_ledgers` actually spaces
+    /// executions out: the second child cannot run before its own due
+    /// ledger, even though it is within the intent's overall window and
+    /// under `max_executions`.
+    #[test]
+    fn interval_ledgers_spaces_out_recurring_executions() {
+        let (env, client, _admin) = setup();
+        let mut scheduled = intent(&env, 60);
+        scheduled.start_ledger = 100;
+        scheduled.end_ledger = 100_000;
+        scheduled.interval_ledgers = 1000;
+        scheduled.max_executions = 3;
+        let intent_id = scheduled.intent_id.clone();
+        client.create_intent(&scheduled);
+
+        set_ledger(&env, 100);
+        client.mark_child_executed(&intent_id, &1);
+
+        // Child 2 is due at start_ledger + interval_ledgers = 1100, not yet.
+        let too_early = client.try_mark_child_executed(&intent_id, &2);
+        assert_eq!(too_early, Err(Ok(IntentRegistryError::ExecutionTooEarly)));
+
+        set_ledger(&env, 1100);
+        client.mark_child_executed(&intent_id, &2);
+        assert_eq!(client.get_intent(&intent_id).execution_count, 2);
+    }
+
+    /// `interval_ledgers: 0` (the default) is a deliberate opt-out, not a
+    /// degenerate case — existing bounded-batch behavior (any unused
+    /// child_sequence, any time in the window) is preserved exactly.
+    /// Already covered end-to-end by every other test in this module using
+    /// the `intent()` helper's default; this makes the "0 means no cadence
+    /// enforced" contract explicit on its own.
+    #[test]
+    fn zero_interval_ledgers_enforces_no_cadence() {
+        let (env, client, _admin) = setup();
+        let mut scheduled = intent(&env, 61);
+        scheduled.max_executions = 2;
+        let intent_id = scheduled.intent_id.clone();
+        client.create_intent(&scheduled);
+
+        set_ledger(&env, scheduled.start_ledger);
+        client.mark_child_executed(&intent_id, &1);
+        client.mark_child_executed(&intent_id, &2);
+        assert_eq!(client.get_intent(&intent_id).execution_count, 2);
+    }
+
+    /// A cadence that would push the final execution's due ledger past the
+    /// declared window is rejected at creation, not silently left
+    /// unreachable — the signer approved `max_executions`, and the last
+    /// one or more becoming impossible would quietly shrink that approval.
+    #[test]
+    fn create_intent_rejects_a_cadence_that_pushes_the_last_execution_past_the_window() {
+        let (env, client, _admin) = setup();
+        let mut scheduled = intent(&env, 62);
+        scheduled.start_ledger = 100;
+        scheduled.end_ledger = 1_000;
+        scheduled.interval_ledgers = 1000;
+        scheduled.max_executions = 3; // last due ledger: 100 + 1000*2 = 2100 > 1000
 
         let err = client.try_create_intent(&scheduled);
         assert_eq!(err, Err(Ok(IntentRegistryError::InvalidWindow)));

@@ -30,8 +30,9 @@
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address,
-    BytesN, Env, Symbol, Vec,
+    BytesN, Env, Map, Symbol, Val, Vec,
 };
+use stellar_accounts::smart_account::Signer;
 
 const MAX_APPROVERS: u32 = 20;
 
@@ -78,11 +79,30 @@ const TTL_THRESHOLD_LEDGERS: u32 = TTL_EXTEND_TO_LEDGERS - 17280; // ~29 days
 #[contract]
 pub struct RecoveryManager;
 
+/// Security review finding: recovery originally only ever replaced
+/// `Ownable`'s `owner` — but day-to-day spend authority on `smart_account`
+/// is the OZ context-rule/signer registry, a completely separate
+/// authorization system `owner` does not gate at all (see
+/// `docs/GOVERNANCE_MULTISIG_DESIGN.md` §9). A compromised *payment
+/// signer* — the more likely operational compromise, not the owner key —
+/// survived recovery entirely: the account unfroze, ownership changed, and
+/// the same compromised signer could still call `execute_transfer_payment`
+/// immediately afterward. `docs/TECHNICAL_ARCHITECTURE.md` §12.7 already
+/// documented the intended behavior ("Old signers and sessions are
+/// cleared. New signers are installed.") — this had never actually been
+/// implemented. `replacement_signers`/`replacement_policies` carry what
+/// `smart_account::apply_recovery` installs as the account's *only*
+/// context rule once finalized, replacing every existing one — see that
+/// function's doc comment for why replacing rather than merely adding is
+/// necessary (the old, possibly-compromised signers must lose authority,
+/// not just gain a parallel escape hatch).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryRequest {
     pub request_id: BytesN<32>,
     pub replacement_owner: Address,
+    pub replacement_signers: Vec<Signer>,
+    pub replacement_policies: Map<Address, Val>,
     pub earliest_ledger: u32,
     pub approvers: Vec<Address>,
     pub cancelled: bool,
@@ -189,6 +209,7 @@ enum DataKey {
     PendingGuardianRemoval(Address),
     Request(BytesN<32>),
     GuardianFreezeEpoch,
+    GuardianCount,
 }
 
 #[contracterror]
@@ -215,6 +236,8 @@ pub enum RecoveryManagerError {
     NoPendingThresholdChange = 4017,
     GuardianChangeDelayNotElapsed = 4018,
     GuardianFreezeEpochOverflow = 4019,
+    NoReplacementSigners = 4020,
+    ThresholdWouldBecomeUnsatisfiable = 4021,
 }
 
 #[contractimpl]
@@ -291,6 +314,15 @@ impl RecoveryManager {
         if new_threshold == 0 {
             return Err(RecoveryManagerError::InvalidThreshold);
         }
+        // Security review finding: only `== 0` was ever rejected, so an
+        // admin (including a compromised one, or one that simply made a
+        // mistake) could propose a threshold higher than the number of
+        // guardians that will ever exist, permanently disabling recovery
+        // — see `apply_guardian_removal`'s identical check for the mirror
+        // case (removing a guardian out from under an existing threshold).
+        if new_threshold > guardian_count(&env) {
+            return Err(RecoveryManagerError::ThresholdWouldBecomeUnsatisfiable);
+        }
         let effective_ledger = env
             .ledger()
             .sequence()
@@ -344,6 +376,14 @@ impl RecoveryManager {
         if env.ledger().sequence() < pending.effective_ledger {
             return Err(RecoveryManagerError::GuardianChangeDelayNotElapsed);
         }
+        // Re-checked at apply time, not just proposal time: the guardian
+        // count may have dropped during this change's own timelock window
+        // (a guardian removal applied in between), which could make a
+        // threshold that was valid when proposed unsatisfiable by the time
+        // it actually lands.
+        if pending.new_threshold > guardian_count(&env) {
+            return Err(RecoveryManagerError::ThresholdWouldBecomeUnsatisfiable);
+        }
         env.storage()
             .instance()
             .set(&DataKey::GuardianThreshold, &pending.new_threshold);
@@ -378,6 +418,12 @@ impl RecoveryManager {
             .ok_or(RecoveryManagerError::GuardianAlreadyExists)?;
         env.storage().persistent().set(&key, &activates_at);
         bump_ttl(&env, &key);
+        let new_count = guardian_count(&env)
+            .checked_add(1)
+            .ok_or(RecoveryManagerError::GuardianAlreadyExists)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::GuardianCount, &new_count);
         GuardianAdded {
             guardian: guardian.clone(),
             activates_at,
@@ -461,10 +507,28 @@ impl RecoveryManager {
             return Err(RecoveryManagerError::GuardianChangeDelayNotElapsed);
         }
 
+        // Security review finding: nothing previously stopped the guardian
+        // count from dropping below `guardian_threshold`, silently making
+        // `finalize_recovery` permanently unreachable — a direct violation
+        // of `docs/SMART_CONTRACT_SPECIFICATION.md` §8's own invariant
+        // ("signer thresholds cannot be configured into an unusable
+        // state"). Re-checked here, at apply time rather than propose
+        // time, since the threshold or guardian count may have changed
+        // during this removal's own timelock window.
+        let remaining = guardian_count(&env)
+            .checked_sub(1)
+            .ok_or(RecoveryManagerError::ThresholdWouldBecomeUnsatisfiable)?;
+        if remaining < guardian_threshold(&env) {
+            return Err(RecoveryManagerError::ThresholdWouldBecomeUnsatisfiable);
+        }
+
         env.storage()
             .persistent()
             .remove(&DataKey::Guardian(guardian.clone()));
         env.storage().persistent().remove(&pending_key);
+        env.storage()
+            .instance()
+            .set(&DataKey::GuardianCount, &remaining);
         GuardianRemoved {
             guardian: guardian.clone(),
         }
@@ -548,11 +612,22 @@ impl RecoveryManager {
     /// `approve_recovery`'s threshold and `finalize_recovery`'s timelock
     /// are what actually gate the outcome, not who was allowed to open the
     /// request.
+    ///
+    /// `replacement_signers`/`replacement_policies` must describe a
+    /// satisfiable context rule (at least one signer or one policy) — see
+    /// `RecoveryRequest`'s doc comment for why recovery needs to carry
+    /// this at all, not just `replacement_owner`. Rejected fast, here, if
+    /// `replacement_signers` is empty, rather than letting a genuinely
+    /// unsatisfiable recovery reach `finalize_recovery`'s quorum/timelock
+    /// only to make `smart_account::apply_recovery` panic on an empty
+    /// rule.
     pub fn open_recovery(
         env: Env,
         caller: Address,
         request_id: BytesN<32>,
         replacement_owner: Address,
+        replacement_signers: Vec<Signer>,
+        replacement_policies: Map<Address, Val>,
         earliest_ledger: u32,
     ) -> Result<(), RecoveryManagerError> {
         ensure_initialized(&env)?;
@@ -564,6 +639,9 @@ impl RecoveryManager {
             .ok_or(RecoveryManagerError::NotInitialized)?;
         if caller != admin && !is_active_guardian(&env, &caller) {
             return Err(RecoveryManagerError::Unauthorized);
+        }
+        if replacement_signers.is_empty() {
+            return Err(RecoveryManagerError::NoReplacementSigners);
         }
 
         let key = DataKey::Request(request_id.clone());
@@ -582,6 +660,8 @@ impl RecoveryManager {
         let request = RecoveryRequest {
             request_id: request_id.clone(),
             replacement_owner,
+            replacement_signers,
+            replacement_policies,
             earliest_ledger,
             approvers: Vec::new(&env),
             cancelled: false,
@@ -772,6 +852,18 @@ fn guardian_freeze_epoch(env: &Env) -> u32 {
         .unwrap_or(0)
 }
 
+/// Total registered guardians, active or not — deliberately *not*
+/// `is_active_guardian`'s narrower count. A not-yet-active guardian will
+/// become active eventually (barring removal), so it still counts toward
+/// whether a threshold is *ever* satisfiable, which is the question this
+/// exists to answer.
+fn guardian_count(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::GuardianCount)
+        .unwrap_or(0)
+}
+
 fn live_approval_count(env: &Env, request: &RecoveryRequest) -> u32 {
     let mut count = 0_u32;
     for guardian in request.approvers.iter() {
@@ -816,6 +908,7 @@ mod tests {
     use soroban_sdk::testutils::{
         storage::Instance as _, storage::Persistent as _, Address as _, Ledger, LedgerInfo,
     };
+    use soroban_sdk::vec;
 
     fn setup() -> (Env, RecoveryManagerClient<'static>, Address) {
         let env = Env::default();
@@ -829,6 +922,10 @@ mod tests {
 
     fn id(env: &Env, seed: u8) -> BytesN<32> {
         BytesN::from_array(env, &[seed; 32])
+    }
+
+    fn replacement_signers(env: &Env) -> Vec<Signer> {
+        vec![env, Signer::Delegated(Address::generate(env))]
     }
 
     fn set_ledger(env: &Env, sequence_number: u32) {
@@ -854,7 +951,14 @@ mod tests {
 
         client.add_guardian(&guardian_a);
         client.add_guardian(&guardian_b);
-        client.open_recovery(&admin, &request_id, &replacement, &17280);
+        client.open_recovery(
+            &admin,
+            &request_id,
+            &replacement,
+            &replacement_signers(&env),
+            &Map::new(&env),
+            &17280,
+        );
         // Guardians activate at the same ledger the recovery timelock
         // opens (both constants are 17280 in this test build) — advance
         // once, which satisfies guardian activation for approval AND the
@@ -874,7 +978,14 @@ mod tests {
         let guardian = Address::generate(&env);
 
         client.add_guardian(&guardian);
-        client.open_recovery(&admin, &request_id, &Address::generate(&env), &17280);
+        client.open_recovery(
+            &admin,
+            &request_id,
+            &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
+            &17280,
+        );
         set_ledger(&env, 17280);
         client.approve_recovery(&request_id, &guardian);
 
@@ -900,7 +1011,14 @@ mod tests {
         let guardian = Address::generate(&env);
 
         client.add_guardian(&guardian);
-        client.open_recovery(&admin, &request_id, &Address::generate(&env), &17280);
+        client.open_recovery(
+            &admin,
+            &request_id,
+            &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
+            &17280,
+        );
 
         // Still ledger 0: guardian activates at 17280, not yet active.
         let too_early = client.try_approve_recovery(&request_id, &guardian);
@@ -919,6 +1037,10 @@ mod tests {
         let request_id = id(&env, 5);
         let guardian = Address::generate(&env);
 
+        // setup()'s threshold is 2 -- two other guardians keep the count
+        // satisfiable (3 -> 2) once `guardian` is removed below.
+        client.add_guardian(&Address::generate(&env));
+        client.add_guardian(&Address::generate(&env));
         client.add_guardian(&guardian);
         client.propose_remove_guardian(&guardian);
         set_ledger(&env, GUARDIAN_CHANGE_DELAY_LEDGERS);
@@ -928,6 +1050,8 @@ mod tests {
             &admin,
             &request_id,
             &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
             &(GUARDIAN_CHANGE_DELAY_LEDGERS * 2),
         );
         let revoked = client.try_approve_recovery(&request_id, &guardian);
@@ -993,7 +1117,10 @@ mod tests {
     /// cancelled proposal cannot later be applied.
     #[test]
     fn threshold_change_cannot_be_applied_before_the_delay_elapses() {
-        let (_env, client, _admin) = setup();
+        let (env, client, _admin) = setup();
+        client.add_guardian(&Address::generate(&env));
+        client.add_guardian(&Address::generate(&env));
+        client.add_guardian(&Address::generate(&env));
         client.propose_threshold_change(&3);
 
         let too_early = client.try_apply_threshold_change();
@@ -1006,6 +1133,9 @@ mod tests {
     #[test]
     fn threshold_change_can_be_cancelled_before_it_takes_effect() {
         let (env, client, _admin) = setup();
+        client.add_guardian(&Address::generate(&env));
+        client.add_guardian(&Address::generate(&env));
+        client.add_guardian(&Address::generate(&env));
         client.propose_threshold_change(&3);
         client.cancel_threshold_change();
 
@@ -1033,14 +1163,19 @@ mod tests {
     fn applying_guardian_removal_and_threshold_change_needs_no_authorization() {
         let (env, client, _admin) = setup();
         let guardian = Address::generate(&env);
+        let other_guardian = Address::generate(&env);
         client.add_guardian(&guardian);
+        client.add_guardian(&other_guardian);
         client.propose_remove_guardian(&guardian);
+        // Lowered to 1 so removing `guardian` still leaves a satisfiable
+        // threshold (1 remaining guardian, threshold 1) -- both changes
+        // apply in the same window below.
         client.propose_threshold_change(&1);
 
         set_ledger(&env, GUARDIAN_CHANGE_DELAY_LEDGERS);
         env.set_auths(&[]);
-        client.apply_guardian_removal(&guardian);
         client.apply_threshold_change();
+        client.apply_guardian_removal(&guardian);
         assert!(!client.is_guardian(&guardian));
     }
 
@@ -1049,7 +1184,14 @@ mod tests {
         let (env, client, admin) = setup();
         let request_id = id(&env, 7);
 
-        client.open_recovery(&admin, &request_id, &Address::generate(&env), &17280);
+        client.open_recovery(
+            &admin,
+            &request_id,
+            &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
+            &17280,
+        );
         client.cancel_recovery(&request_id);
 
         set_ledger(&env, 17280);
@@ -1069,7 +1211,14 @@ mod tests {
         // A recovery timelock longer than the guardian activation delay,
         // so there's a window where guardians are active but the
         // request's own timelock has not yet opened.
-        client.open_recovery(&admin, &request_id, &Address::generate(&env), &30_000);
+        client.open_recovery(
+            &admin,
+            &request_id,
+            &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
+            &30_000,
+        );
         set_ledger(&env, 17280);
         client.approve_recovery(&request_id, &guardian_a);
         client.approve_recovery(&request_id, &guardian_b);
@@ -1090,10 +1239,25 @@ mod tests {
         let request_id = id(&env, 11);
         let guardian_a = Address::generate(&env);
         let guardian_b = Address::generate(&env);
+        // A buffer guardian, never used for approval: without it, removing
+        // guardian_a below would drop the count to 1 against setup()'s
+        // threshold of 2, which the security-review fix for finding 5
+        // (threshold satisfiability) now correctly rejects. Real
+        // deployments should always run with this kind of buffer (N >
+        // threshold) for exactly this reason — a single guardian removal
+        // should never be able to brick recovery on its own.
+        client.add_guardian(&Address::generate(&env));
 
         client.add_guardian(&guardian_a);
         client.add_guardian(&guardian_b);
-        client.open_recovery(&admin, &request_id, &Address::generate(&env), &17280);
+        client.open_recovery(
+            &admin,
+            &request_id,
+            &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
+            &17280,
+        );
         set_ledger(&env, 17280);
         client.approve_recovery(&request_id, &guardian_a);
         client.approve_recovery(&request_id, &guardian_b);
@@ -1138,9 +1302,20 @@ mod tests {
         let guardian_a = Address::generate(&env);
         let guardian_b = Address::generate(&env);
 
+        // A third guardian, never asked to approve: raising the threshold
+        // to 3 below needs at least 3 guardians to exist at all, per the
+        // security-review fix for finding 5 (threshold satisfiability).
+        client.add_guardian(&Address::generate(&env));
         client.add_guardian(&guardian_a);
         client.add_guardian(&guardian_b);
-        client.open_recovery(&admin, &request_id, &Address::generate(&env), &17280);
+        client.open_recovery(
+            &admin,
+            &request_id,
+            &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
+            &17280,
+        );
         set_ledger(&env, 17280);
         client.approve_recovery(&request_id, &guardian_a);
         client.approve_recovery(&request_id, &guardian_b);
@@ -1168,7 +1343,14 @@ mod tests {
 
         client.add_guardian(&guardian_a);
         client.add_guardian(&guardian_b);
-        client.open_recovery(&admin, &request_id, &Address::generate(&env), &17280);
+        client.open_recovery(
+            &admin,
+            &request_id,
+            &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
+            &17280,
+        );
         set_ledger(&env, 17280);
         client.approve_recovery(&request_id, &guardian_a);
         client.approve_recovery(&request_id, &guardian_b);
@@ -1201,12 +1383,20 @@ mod tests {
             &admin,
             &request_id,
             &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
             &(MIN_RECOVERY_DELAY_LEDGERS - 1),
         );
         assert_eq!(too_soon, Err(Ok(RecoveryManagerError::DelayTooShort)));
 
-        let in_the_past =
-            client.try_open_recovery(&admin, &request_id, &Address::generate(&env), &0);
+        let in_the_past = client.try_open_recovery(
+            &admin,
+            &request_id,
+            &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
+            &0,
+        );
         assert_eq!(in_the_past, Err(Ok(RecoveryManagerError::DelayTooShort)));
 
         // Exactly the minimum is accepted.
@@ -1214,6 +1404,8 @@ mod tests {
             &admin,
             &request_id,
             &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
             &MIN_RECOVERY_DELAY_LEDGERS,
         );
     }
@@ -1232,6 +1424,8 @@ mod tests {
             &admin,
             &request_id,
             &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
             &(100_000 + MIN_RECOVERY_DELAY_LEDGERS - 1),
         );
         assert_eq!(too_soon, Err(Ok(RecoveryManagerError::DelayTooShort)));
@@ -1240,6 +1434,8 @@ mod tests {
             &admin,
             &request_id,
             &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
             &(100_000 + MIN_RECOVERY_DELAY_LEDGERS),
         );
     }
@@ -1259,7 +1455,14 @@ mod tests {
         let guardian = Address::generate(&env);
         client.add_guardian(&guardian);
         let request_id = id(&env, 99);
-        client.open_recovery(&admin, &request_id, &Address::generate(&env), &17280);
+        client.open_recovery(
+            &admin,
+            &request_id,
+            &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
+            &17280,
+        );
 
         let guardian_ttl = env.as_contract(&contract_id, || {
             env.storage()
@@ -1313,6 +1516,10 @@ mod tests {
 
         let guardian = Address::generate(&env);
         client.add_guardian(&guardian);
+        // A second guardian: raising the threshold to 2 below needs at
+        // least 2 guardians to exist, per the security-review fix for
+        // finding 5 (threshold satisfiability).
+        client.add_guardian(&Address::generate(&env));
         client.propose_threshold_change(&2);
         client.propose_remove_guardian(&guardian);
 
@@ -1385,6 +1592,15 @@ mod tests {
             assert!(env.storage().instance().has(&DataKey::GuardianThreshold));
         });
 
+        client.add_guardian(&Address::generate(&env));
+        env.as_contract(&contract_id, || {
+            assert!(!env.storage().persistent().has(&DataKey::GuardianCount));
+            assert!(env.storage().instance().has(&DataKey::GuardianCount));
+        });
+
+        client.add_guardian(&Address::generate(&env));
+        client.add_guardian(&Address::generate(&env));
+        client.add_guardian(&Address::generate(&env));
         env.ledger()
             .with_mut(|l| l.sequence_number += TTL_THRESHOLD_LEDGERS / 2);
         client.propose_threshold_change(&3);
@@ -1410,6 +1626,76 @@ mod tests {
         assert_eq!(err, Err(Ok(RecoveryManagerError::InvalidThreshold)));
     }
 
+    /// Security review finding: `docs/SMART_CONTRACT_SPECIFICATION.md` §8's
+    /// own invariant says "signer thresholds cannot be configured into an
+    /// unusable state," but only `== 0` was ever rejected — a threshold
+    /// higher than the guardian count that will ever exist silently
+    /// bricked recovery forever, reachable by an admin mistake or a
+    /// compromised admin deliberately disabling the one mechanism meant to
+    /// route around a compromised owner.
+    #[test]
+    fn propose_threshold_change_rejects_threshold_above_guardian_count() {
+        let (env, client, _admin) = setup();
+        client.add_guardian(&Address::generate(&env));
+
+        let err = client.try_propose_threshold_change(&2);
+        assert_eq!(
+            err,
+            Err(Ok(RecoveryManagerError::ThresholdWouldBecomeUnsatisfiable))
+        );
+    }
+
+    /// Mirror case: removing a guardian must not silently drop the count
+    /// below the *current* threshold either — the same invariant, reached
+    /// from the guardian-membership side instead of the threshold side.
+    #[test]
+    fn apply_guardian_removal_rejects_when_it_would_make_threshold_unsatisfiable() {
+        let (env, client, _admin) = setup();
+        let guardian_a = Address::generate(&env);
+        let guardian_b = Address::generate(&env);
+        client.add_guardian(&guardian_a);
+        client.add_guardian(&guardian_b);
+
+        client.propose_remove_guardian(&guardian_a);
+        set_ledger(&env, GUARDIAN_CHANGE_DELAY_LEDGERS);
+        let err = client.try_apply_guardian_removal(&guardian_a);
+        assert_eq!(
+            err,
+            Err(Ok(RecoveryManagerError::ThresholdWouldBecomeUnsatisfiable))
+        );
+        // Rejected atomically: the guardian is still fully registered, not
+        // partially removed.
+        assert!(client.is_guardian(&guardian_a));
+    }
+
+    /// Re-checked at apply time, not just proposal time: a threshold
+    /// change proposed while satisfiable can still be blocked from landing
+    /// if a guardian removal applies first, during the same timelock
+    /// window, and drops the count below what was proposed.
+    #[test]
+    fn apply_threshold_change_rejects_when_guardian_count_dropped_during_the_delay() {
+        let (env, client, _admin) = setup();
+        let guardian_a = Address::generate(&env);
+        let guardian_b = Address::generate(&env);
+        let guardian_c = Address::generate(&env);
+        client.add_guardian(&guardian_a);
+        client.add_guardian(&guardian_b);
+        client.add_guardian(&guardian_c);
+
+        // Valid when proposed: 3 guardians support a threshold of 3.
+        client.propose_threshold_change(&3);
+        // A guardian is removed in the same window -- now only 2 remain.
+        client.propose_remove_guardian(&guardian_c);
+        set_ledger(&env, GUARDIAN_CHANGE_DELAY_LEDGERS);
+        client.apply_guardian_removal(&guardian_c);
+
+        let err = client.try_apply_threshold_change();
+        assert_eq!(
+            err,
+            Err(Ok(RecoveryManagerError::ThresholdWouldBecomeUnsatisfiable))
+        );
+    }
+
     #[test]
     fn add_guardian_rejects_duplicate() {
         let (env, client, _admin) = setup();
@@ -1424,6 +1710,12 @@ mod tests {
     fn is_guardian_reflects_registration_and_removal() {
         let (env, client, _admin) = setup();
         let guardian = Address::generate(&env);
+
+        // Two buffer guardians: setup()'s threshold is 2, and removing
+        // `guardian` below needs the count to stay >= 2 afterward, per the
+        // security-review fix for finding 5 (threshold satisfiability).
+        client.add_guardian(&Address::generate(&env));
+        client.add_guardian(&Address::generate(&env));
 
         assert!(!client.is_guardian(&guardian));
         client.add_guardian(&guardian);
@@ -1444,9 +1736,23 @@ mod tests {
     fn open_recovery_rejects_duplicate_request_id() {
         let (env, client, admin) = setup();
         let request_id = id(&env, 50);
-        client.open_recovery(&admin, &request_id, &Address::generate(&env), &17280);
+        client.open_recovery(
+            &admin,
+            &request_id,
+            &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
+            &17280,
+        );
 
-        let err = client.try_open_recovery(&admin, &request_id, &Address::generate(&env), &17280);
+        let err = client.try_open_recovery(
+            &admin,
+            &request_id,
+            &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
+            &17280,
+        );
         assert_eq!(err, Err(Ok(RecoveryManagerError::RequestAlreadyExists)));
     }
 
@@ -1457,7 +1763,14 @@ mod tests {
     fn approve_recovery_rejects_beyond_max_approvers() {
         let (env, client, admin) = setup();
         let request_id = id(&env, 51);
-        client.open_recovery(&admin, &request_id, &Address::generate(&env), &17280);
+        client.open_recovery(
+            &admin,
+            &request_id,
+            &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
+            &17280,
+        );
         set_ledger(&env, 17280);
 
         let mut guardians = std::vec::Vec::new();
@@ -1498,6 +1811,8 @@ mod tests {
             &guardian,
             &request_id,
             &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
             &(GUARDIAN_ACTIVATION_DELAY_LEDGERS + MIN_RECOVERY_DELAY_LEDGERS),
         );
 
@@ -1520,6 +1835,8 @@ mod tests {
             &guardian,
             &request_id,
             &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
             &MIN_RECOVERY_DELAY_LEDGERS,
         );
         assert_eq!(err, Err(Ok(RecoveryManagerError::Unauthorized)));
@@ -1537,6 +1854,8 @@ mod tests {
             &stranger,
             &request_id,
             &Address::generate(&env),
+            &replacement_signers(&env),
+            &Map::new(&env),
             &MIN_RECOVERY_DELAY_LEDGERS,
         );
         assert_eq!(err, Err(Ok(RecoveryManagerError::Unauthorized)));

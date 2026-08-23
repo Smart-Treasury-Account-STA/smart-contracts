@@ -26,6 +26,11 @@
 | 16 | Medium/Low | `account_factory`'s salt derivation hashed only `base \|\| tag`, not `caller`, despite the doc comment claiming salts were scoped per caller — any two callers submitting the same raw salt would collide | **Fixed** — `caller` folded into the hash |
 | 17 | Low | `stellar contract build` warns that `OzSmartAccountError` (an external crate's error type, used as `__check_auth`'s associated `Error`) is not defined in the exported contract spec, on both `smart_account` and `governance_account` | Confirmed, no fix applied (see rationale below) |
 | 18 | Low (documentation drift) | `README.md` said "seven Soroban contract packages"; the workspace has ten (`threshold_policy`, `governance_account`, `account_factory` were never added to the table) | **Fixed** |
+| 19 | **High** | Recovery only ever replaced `Ownable`'s `owner` — spend authority (the OZ context-rule/signer registry) is a separate system `owner` never gates, so a compromised *payment signer* survived recovery entirely | **Fixed** — `RecoveryRequest` carries replacement signers/policies; `apply_recovery` replaces the whole topology |
+| 20 | Medium | `apply_recovery` never synced its local guardian-freeze-epoch bookkeeping, so a freeze epoch bumped during (or shortly before) recovery could re-freeze the account immediately after recovery completed, off a stale request | **Fixed** — synced in the same `apply_recovery` call |
+| 21 | Medium | Guardian threshold could be configured or drift (via removal) above the actual guardian count, silently and permanently disabling recovery — a direct violation of `docs/SMART_CONTRACT_SPECIFICATION.md` §8's own stated invariant | **Fixed** — `GuardianCount` tracked and validated at propose/apply-threshold-change and apply-guardian-removal |
+| 22 | Medium | `ScheduledIntent` had no cadence field — an executor could consume an entire "recurring" allowance the instant the window opened | **Fixed** — opt-in `interval_ledgers` |
+| 23 | Medium/Low | Reviewer's "checked-in `wasm/` artifacts are stale" — **premise not accurate** (`wasm/` is gitignored, never tracked by git), but real, related hygiene gaps existed: stale local build output on disk, and no CI check that the genuinely tracked `account_factory` WASM fixtures stay fresh | **Fixed** — stale local `wasm/` removed; new CI step fails the build if the tracked fixtures drift from current source |
 
 ---
 
@@ -214,6 +219,45 @@ fn execute(e: &Env, target: Address, target_fn: Symbol, target_args: Vec<Val>) {
 
 **Fix.** Updated to "Ten Soroban contract packages" with all three added to the table, and the closing paragraph updated to mention self-service deployment and governance distribution alongside the original four capabilities.
 
+## 19. Recovery never replaced spend authority, only ownership (Fixed — High)
+
+**Finding, from a second senior review pass.** `RecoveryRequest` stored only `replacement_owner`; `apply_recovery` overwrote `Ownable`'s `owner` and cleared `Frozen` — nothing else. But `execute_transfer_payment`, `execute_split_payment`, and every other spend-relevant entrypoint are gated by `e.current_contract_address().require_auth()`, the OZ context-rule/signer registry — a system `owner` never touches (already established in finding 4/`GOVERNANCE_MULTISIG_DESIGN.md` §9). Concretely: after a full guardian-quorum recovery completed, ownership changed and the freeze lifted, but the *same, possibly-compromised payment signer* from before the incident remained fully authorized to keep spending immediately. `docs/TECHNICAL_ARCHITECTURE.md` §12.7 already documented the intended behavior — "Old signers and sessions are cleared. New signers are installed." — this had simply never been implemented.
+
+**Fix.** `RecoveryRequest` (and `RecoveryRequestView`, its mirror on the `smart_account` side) now carries `replacement_signers: Vec<Signer>` and `replacement_policies: Map<Address, Val>`, supplied to `open_recovery` and validated non-empty there (fails fast rather than letting an unsatisfiable recovery reach the quorum/timelock only to panic later). `apply_recovery` now, in the same call: removes *every* existing context rule (`clear_all_context_rules` — old, possibly-compromised signers must lose authority entirely, not just gain a parallel escape hatch alongside new ones) and installs exactly one fresh rule carrying the guardian-approved replacement signers/policies (`install_default_context_rule`, the same raw, unauthenticated storage primitive `initialize` itself uses to bootstrap — the guardian quorum + timelock already verified upstream *is* the authorization here). Context rule IDs are assigned by a monotonic, never-reused counter, so every ID up to `NextId` is checked for existence rather than assumed contiguous.
+
+Verified with `apply_recovery_replaces_owner_lifts_freeze_and_replaces_signers_exactly_once` (`contracts/smart_account/src/test.rs`): confirms exactly one context rule exists both before and after recovery, that the *old* rule ID (0) is gone (`get_context_rule(&0)` now errors), and that the new rule (ID 1) carries only the recovery-approved signer.
+
+## 20. Stale guardian-freeze epoch could survive recovery (Fixed — Medium)
+
+**Finding, from a second senior review pass.** `apply_guardian_freeze` compares `recovery_manager`'s current freeze epoch (finding 14's fix) against a locally-stored `LastAppliedGuardianFreezeEpoch`. `apply_recovery` never touched that local value. Scenario: a guardian bumps the freeze epoch while recovery is already underway (or shortly before), nobody applies that specific freeze before recovery finalizes, and the just-recovered, just-unfrozen account can be re-frozen immediately afterward by anyone (`apply_guardian_freeze` is permissionless) off a request that has nothing to do with whatever recovery just resolved.
+
+**Fix.** `apply_recovery` now reads `recovery_manager`'s current `guardian_freeze_epoch` and writes it to `LastAppliedGuardianFreezeEpoch` in the same call, before lifting the freeze — any freeze epoch that existed at recovery time is treated as already accounted for; only a genuinely *new* freeze request after recovery can freeze the account again.
+
+## 21. Guardian threshold could be configured or drift into an unusable state (Fixed — Medium)
+
+**Finding, from a second senior review pass.** `initialize`/`propose_threshold_change` rejected only `threshold == 0`. Nothing stopped a threshold higher than the guardian count that will ever exist — reachable either by proposing too high a threshold directly, or by removing guardians out from under an already-valid one — permanently and silently disabling `finalize_recovery`. This is a direct violation of `docs/SMART_CONTRACT_SPECIFICATION.md` §8's own stated invariant ("signer thresholds cannot be configured into an unusable state"), and a genuinely dangerous one: it gives a compromised admin a way to permanently disable the one mechanism meant to route around a compromised owner.
+
+**Fix.** Added a tracked `GuardianCount` (instance storage, incremented in `add_guardian`, decremented in `apply_guardian_removal`), and validate against it at every point either side of the threshold/guardian-count relationship can change:
+- `propose_threshold_change` rejects `new_threshold > guardian_count`.
+- `apply_threshold_change` re-validates at apply time too (not just proposal time), since the guardian count may have dropped during the change's own timelock window.
+- `apply_guardian_removal` rejects a removal that would drop the count below the *current* threshold — the admin must lower the threshold first if a removal is otherwise blocked, mirroring how real multisig systems require maintaining N-of-M feasibility on every membership change, not just at setup.
+
+`initialize` itself is deliberately left unchanged: guardians are always added *after* initialize, so guardian count is always 0 at that point — the invariant only becomes meaningful, and is only enforced, from the first real guardian/threshold action onward. Verified with three new dedicated tests (`propose_threshold_change_rejects_threshold_above_guardian_count`, `apply_guardian_removal_rejects_when_it_would_make_threshold_unsatisfiable`, `apply_threshold_change_rejects_when_guardian_count_dropped_during_the_delay`), plus nine pre-existing tests updated to add the guardian "buffer" a realistic deployment should already run with.
+
+## 22. No cadence enforcement for recurring scheduled payments (Fixed — Medium)
+
+**Finding, from a second senior review pass.** `ScheduledIntent` bounded a *total* allowance (`start_ledger`/`end_ledger`/`max_executions`) but nothing prevented the executor from consuming every remaining execution the instant the window opened — correct for bounded batch execution, wrong for a genuinely recurring schedule (e.g. "$1,000/month for a year"), where spreading executions out over time is the entire point.
+
+**Fix.** Added an opt-in `interval_ledgers: u32` field to `ScheduledIntent`/`ScheduledIntentArgs`. `0` (the default) preserves the original behavior exactly — no behavior change for existing callers or the bounded-batch use case the reviewer explicitly called out as fine. When set, `mark_child_executed` additionally requires `child_sequence`'s own due ledger (`start_ledger + interval_ledgers * (child_sequence - 1)`) to have arrived, and `create_intent` rejects a cadence whose *last* execution would fall outside the declared window at creation time — rather than silently making the final execution(s) unreachable, quietly shrinking the `max_executions` the signer actually approved. Verified with `interval_ledgers_spaces_out_recurring_executions`, `zero_interval_ledgers_enforces_no_cadence`, and `create_intent_rejects_a_cadence_that_pushes_the_last_execution_past_the_window` (`contracts/intent_registry/src/lib.rs`).
+
+## 23. Stale WASM: premise inaccurate, real gap fixed anyway (Fixed — Medium/Low)
+
+**Finding, from a second senior review pass.** The review's premise — that `wasm/sta_smart_account.wasm` and others were "checked-in" and stale — does not hold: `git ls-files wasm/` and `git check-ignore -v` both confirm `wasm/*.wasm` is covered by the blanket `*.wasm` `.gitignore` rule and was never tracked. Nothing shipped to anyone cloning this repository was stale; CI's own `stellar contract build --optimize --out-dir wasm` step runs on an ephemeral runner and commits nothing back.
+
+**What was real.** The stale files existed locally on disk (dated well before this session's fixes — including the finding-13 `ExecutionEntryPoint` removal), which could mislead anyone working in this exact environment into manually deploying from them. More importantly, the reviewer's underlying concern generalizes correctly to a file set that *is* tracked and *does* matter for correctness: `contracts/account_factory/src/wasm_fixtures/*.wasm`, which `sta-account-factory`'s own test suite deploys against. Nothing previously verified those stayed in sync with the contracts they're built from — exactly the "false green, not a real one" risk that fixture directory's own `README.md` already named.
+
+**Fix.** Removed the stale local `wasm/` directory. Added a CI step, `verify account_factory's WASM fixtures are not stale`, immediately after the existing `stellar contract build` step: it byte-compares each freshly built contract against its corresponding tracked fixture and fails the build (`::error::`) the moment any contract in that set changes without the fixtures being regenerated to match.
+
 ---
 
 ## Verification
@@ -221,7 +265,7 @@ fn execute(e: &Env, target: Address, target_fn: Symbol, target_args: Vec<Val>) {
 All fixes above were run through the project's standard verification trio after landing:
 
 - `cargo build --workspace` — clean.
-- `cargo test --workspace` — 154 unit tests passing (137 before this document's first pass, 139 after findings 1–4, 150 after findings 5–8 and the new `sta-account-factory` package, 153 after finding 11's storage migration added one verifying test per contract, 154 after findings 13–16's fixes and their proof tests — net +1 despite five tests changing behavior, since finding 13 removed one obsolete test and findings 14–16 added new ones), 0 failed.
+- `cargo test --workspace` — 160 unit tests passing (137 before this document's first pass, 139 after findings 1–4, 150 after findings 5–8 and the new `sta-account-factory` package, 153 after finding 11's storage migration added one verifying test per contract, 154 after findings 13–16's fixes and their proof tests, 160 after findings 19–22's fixes and their proof tests — recovery_manager gained 3 new threshold-satisfiability tests and intent_registry gained 3 new cadence tests, smart_account's own recovery test was extended in place rather than added alongside), 0 failed.
 - `cargo clippy --workspace --all-targets -- -D warnings` — clean (this pass's parameter-count growth on `smart_account::initialize` tripped `clippy::too_many_arguments`; see "Argument count" above for the fix, not a suppression).
 - `cargo fmt --all -- --check` — clean.
 

@@ -55,3 +55,19 @@ jobs:
           cargo +1.96.0 install --locked stellar-cli --version 26.0.0
       - name: stellar contract build
         run: stellar contract build --optimize --out-dir wasm
+      - name: verify account_factory's WASM fixtures are not stale
+        # Security review finding: contracts/account_factory/src/wasm_fixtures/
+        # are real, committed WASM binaries sta-account-factory's own test
+        # suite deploys against — if a contract in that fixture set changes
+        # and the fixtures aren't regenerated (see that directory's own
+        # README.md), its tests keep passing against the *old* behavior of
+        # whichever contract changed: a false green, not a real one. This
+        # fails the build the moment that happens, rather than relying on
+        # someone remembering to regenerate them by hand.
+        run: |
+          for name in sta_policy_engine sta_intent_registry sta_recovery_manager sta_transfer_adapter sta_split_adapter sta_smart_account; do
+            if ! cmp -s "wasm/$name.wasm" "contracts/account_factory/src/wasm_fixtures/$name.wasm"; then
+              echo "::error::contracts/account_factory/src/wasm_fixtures/$name.wasm is stale relative to current source -- see that directory's README.md to regenerate it."
+              exit 1
+            fi
+          done
