@@ -29,10 +29,20 @@ fn moves_funds_from_treasury_to_recipient() {
     let recipient = Address::generate(&e);
 
     StellarAssetClient::new(&e, &token).mint(&smart_account, &1_000);
+    let token_client = TokenClient::new(&e, &token);
+    // In the real flow, smart_account grants this allowance itself
+    // (`approve_adapter` in contracts/smart_account/src/lib.rs) immediately
+    // before calling execute_transfer -- see
+    // docs/SECURITY_REVIEW_STRICT.md finding 29.
+    token_client.approve(
+        &smart_account,
+        &client.address,
+        &400,
+        &e.ledger().sequence(),
+    );
 
     client.execute_transfer(&token, &recipient, &400);
 
-    let token_client = TokenClient::new(&e, &token);
     assert_eq!(token_client.balance(&smart_account), 600);
     assert_eq!(token_client.balance(&recipient), 400);
 }

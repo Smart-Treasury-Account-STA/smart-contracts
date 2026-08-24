@@ -40,7 +40,9 @@ use soroban_sdk::{
     auth::{Context, CustomAccountInterface},
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype,
     crypto::Hash,
-    panic_with_error, symbol_short, Address, BytesN, Env, Map, String, Symbol, Val, Vec,
+    panic_with_error, symbol_short,
+    token::TokenClient,
+    Address, BytesN, Env, Map, String, Symbol, Val, Vec,
 };
 use stellar_access::ownable::{self, Ownable as OzOwnable};
 use stellar_accounts::smart_account::{
@@ -628,6 +630,7 @@ impl SmartAccountTreasury {
         });
 
         let adapter = adapter_address(&env, &OP_TRANSFER)?;
+        approve_adapter(&env, &asset, &adapter, amount);
         TransferAdapterClient::new(&env, &adapter).execute_transfer(&asset, &destination, &amount);
 
         TransferPaid {
@@ -681,10 +684,14 @@ impl SmartAccountTreasury {
 
         let policy_engine = policy_engine_address(&env)?;
         let policy_client = PolicyEngineClient::new(&env, &policy_engine);
+        let mut total: i128 = 0;
         for (recipient, amount) in recipients.iter().zip(amounts.iter()) {
             if amount <= 0 {
                 return Err(SmartAccountTreasuryError::InvalidAmount);
             }
+            total = total
+                .checked_add(amount)
+                .ok_or(SmartAccountTreasuryError::InvalidAmount)?;
             policy_client.validate_policy(&PolicyCheck {
                 operation: OP_SPLIT,
                 asset: asset.clone(),
@@ -695,6 +702,7 @@ impl SmartAccountTreasury {
         }
 
         let adapter = adapter_address(&env, &OP_SPLIT)?;
+        approve_adapter(&env, &asset, &adapter, total);
         SplitAdapterClient::new(&env, &adapter).execute_split(&asset, &recipients, &amounts);
 
         SplitPaid {
@@ -821,6 +829,7 @@ impl SmartAccountTreasury {
             expected_version: intent.policy_version,
         });
 
+        approve_adapter(&env, &intent.asset, &intent.adapter, intent.amount);
         TransferAdapterClient::new(&env, &intent.adapter).execute_transfer(
             &intent.asset,
             &intent.destination,
@@ -1151,6 +1160,27 @@ fn adapter_address(env: &Env, operation: &Symbol) -> Result<Address, SmartAccoun
         .instance()
         .get(&DataKey::Adapter(operation.clone()))
         .ok_or(SmartAccountTreasuryError::AdapterNotConfigured)
+}
+
+/// Grants `adapter` a one-shot SAC allowance for exactly `amount` of
+/// `asset`, immediately before delegating to it. See
+/// `docs/SECURITY_REVIEW_STRICT.md` finding 29 and `transfer_adapter`'s
+/// module doc comment: `from == env.current_contract_address()` here
+/// makes this contract the SAC's *direct* caller for `approve`, so
+/// `from.require_auth()` is satisfied by Soroban's invoker-shortcut — no
+/// `__check_auth` invocation happens at all, so this never risks the
+/// contract-reentrancy trap the old direct-`transfer` design hit. The
+/// adapter is expected to fully consume this allowance via `transfer_from`
+/// within the same transaction (the caller-supplied `amount` matches
+/// exactly what the adapter is about to move), so no allowance is ever
+/// left outstanding between transactions.
+fn approve_adapter(env: &Env, asset: &Address, adapter: &Address, amount: i128) {
+    TokenClient::new(env, asset).approve(
+        &env.current_contract_address(),
+        adapter,
+        &amount,
+        &env.ledger().sequence(),
+    );
 }
 
 #[cfg(test)]

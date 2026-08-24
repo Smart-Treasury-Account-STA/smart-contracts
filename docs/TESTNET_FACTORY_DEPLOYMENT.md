@@ -11,6 +11,12 @@ that document's deployment is untouched by anything here.
 
 `soroban-sdk 26.1.0`, `stellar 26.0.0`, `Test SDF Network ; September 2015`.
 
+**Status: the critical finding this record surfaced is fixed and
+re-verified live (§13).** §7.4 and §8 below are kept as the original,
+unedited record of the bug as first found — read them for the diagnosis;
+read §13 for the fix and its live-testnet proof, on a second,
+independently deployed treasury running the fixed contract code.
+
 ## 1. Why a factory deployment, and what this proves
 
 `docs/TESTNET_DEPLOYMENT.md` proved the hand-wired path works. This
@@ -22,7 +28,8 @@ further than the original deployment record on one axis: it exercises
 (`execute_transfer_payment`, `execute_split_payment`,
 `create_scheduled_payment`, `cancel_scheduled_payment`,
 `execute_scheduled_payment`), not just the interactive transfer path — and
-in doing so, surfaced a genuine, previously-undetected bug (§7).
+in doing so, surfaced a genuine, previously-undetected bug (§7.4–§8),
+**now fixed and re-verified live (§13)**.
 
 ## 2. WASM Artifacts
 
@@ -198,11 +205,13 @@ create [`4fb4e60f...`](https://stellar.expert/explorer/testnet/tx/4fb4e60f466c8d
 
 Both calls need only `smart_account`'s own `AuthPayload` — no sub-invocations at all, since `intent_registry`'s `admin.require_auth()` (`admin == smart_account`) is satisfied by Soroban's invoker-shortcut, the same mechanism `smart_account::initialize`'s own bootstrap uses.
 
-### 7.4 `execute_scheduled_payment` — **does not work**, real bug found
+### 7.4 `execute_scheduled_payment` — **did not work on first deployment**, real bug found (fixed, see §13)
 
-See §8 — this is the one entrypoint that could not be completed, and not because of a script mistake.
+See §8 — this is the one entrypoint that could not be completed on this first treasury, and not because of a script mistake. **Now fixed** — §13 re-runs this exact call on a second, independently deployed treasury running the fixed contract code, and it succeeds.
 
-## 8. Real bug found: `execute_scheduled_payment` cannot move funds through an adapter
+## 8. Real bug found: `execute_scheduled_payment` cannot move funds through an adapter (historical — fixed in §13)
+
+**This section describes the bug as originally found, on the first treasury deployed in §5, before the fix.** It is kept unedited as the diagnosis record. See §13 for the fix itself and its live re-verification.
 
 Executing intent `849873c8...`'s first child, as the configured relayer:
 
@@ -350,7 +359,7 @@ python3 scripts/execute_signer_authorized_call.py --call transfer ...
 python3 scripts/execute_signer_authorized_call.py --call split ...
 python3 scripts/execute_signer_authorized_call.py --call create_scheduled ...
 python3 scripts/execute_signer_authorized_call.py --call cancel_scheduled ...
-python3 scripts/execute_scheduled_payment_as_relayer.py ...   # reproduces §8's failure
+python3 scripts/execute_scheduled_payment_as_relayer.py ...   # now succeeds -- see §13
 ```
 
 `scripts/execute_signer_authorized_call.py` and
@@ -359,4 +368,94 @@ additions alongside the existing `scripts/execute_demo_transfer_payment.py`
 and `scripts/bootstrap_intent_registry.py` — all four share the same
 `AuthPayload`/`do_check_auth` construction, documented once in
 `execute_demo_transfer_payment.py`'s docstring and extended in each script
-that builds on it.
+that builds on it. Both scripts were simplified after the §13 fix: neither
+needs to declare a `SAC.transfer` sub-invocation or a `smart_account`
+`AuthPayload` entry for the scheduled-payment execution path any more (see
+their current docstrings for why).
+
+## 13. Fix verified live: a second treasury, same call, now succeeds
+
+`docs/SECURITY_REVIEW_STRICT.md` finding 29 fixes §8's bug:
+`transfer_adapter`/`split_adapter` now draw funds via the SAC's
+`transfer_from(spender, from, to, amount)` instead of its plain
+`transfer(from, to, amount)`. `transfer_from`'s authorization is on
+`spender` — the adapter's own address — satisfied by Soroban's
+invoker-shortcut (the adapter is the SAC's direct caller for this call),
+never `smart_account`'s. `smart_account` grants the adapter an exact,
+one-shot allowance immediately before delegating to it, via a new
+`approve_adapter` helper used by all three of `execute_transfer_payment`,
+`execute_split_payment`, and `execute_scheduled_payment` — that `approve`
+call is *also* invoker-shortcut-satisfied (`smart_account` is the SAC's
+direct caller for `approve`), so it triggers no `__check_auth` invocation
+at all, and therefore never risks the reentrancy §8 hit, regardless of
+whether `smart_account`'s own frame is already active on the stack.
+
+### 13.1 Rebuild, re-upload, and point `account_factory` at the fixed code
+
+```
+$ stellar contract build --optimize --out-dir wasm
+```
+Only three of the six sub-contract hashes changed (`policy_engine`,
+`intent_registry`, `recovery_manager` were untouched by this fix):
+
+| Contract | New WASM hash |
+|---|---|
+| `transfer_adapter` | `785870924ad04930512a5494cbf442b159c912a1f233491d1b0f696fe19f4dae` |
+| `split_adapter` | `e32ad0c7bf83d265848adc2ee4874aa0b3d27fb9b97558c4f8753b40a0ba329b` |
+| `smart_account` | `886bcd312f3cf973a8a037479ebf9febe57139e63f109947acce20bd835f3a76` |
+
+All three re-uploaded ([`198308ea...`](https://stellar.expert/explorer/testnet/tx/198308ea4eec1cee590dfb6645af1b9ca80044e67fff794dc06da9ff47d74ebf), [`b49b0e7c...`](https://stellar.expert/explorer/testnet/tx/b49b0e7c3801044daffbbf8d237c9786a2154f997bfe8ef375a7060a29f20d78), [`e0f8db1e...`](https://stellar.expert/explorer/testnet/tx/e0f8db1eb153cd15dac9e32952a873cdcee685653284abfcda816efe58e5b34d)), each matching the local build byte-for-byte. `contracts/account_factory/src/wasm_fixtures/*.wasm` updated to match (the tracked fixtures CI checks — §2). The existing `account_factory` instance (§3–§4) doesn't need redeploying — its whole purpose is exactly this: `set_wasm_hashes` points all *future* `deploy_account` calls at the new code, deployed treasuries are unaffected either way:
+
+```
+$ stellar contract invoke --id CAQQTRRYNXIQGFVNCTMTBJDXW3PN7O44KPT7GWCCE4FRKTOHDBCWGUZO --source sta-testnet-deployer --network testnet -- \
+  set_wasm_hashes --wasm_hashes '{"policy_engine":"f05348d6...","intent_registry":"43567e68...","recovery_manager":"0eb4038e...","transfer_adapter":"78587092...","split_adapter":"e32ad0c7...","smart_account":"886bcd31..."}'
+```
+[`9dbcc8fa...`](https://stellar.expert/explorer/testnet/tx/9dbcc8fa4c37e65d61a77995eedf3839069811e4585fa3312a85e0de1b74efcf) — `WasmHashesUpdated` event.
+
+### 13.2 A second treasury, deployed with the fixed code
+
+Same `deploy_account` flow as §5, same caller and executor, fresh salt:
+
+[`744150f4...`](https://stellar.expert/explorer/testnet/tx/744150f4671e7bad81454ac09ad2927d9205e8659d2bf9df34d13209ba171395) —
+
+| Contract | Address |
+|---|---|
+| `smart_account` | `CD6GY4UUTNPW4TUV7LDL5SELN4BBHJG4KDDT3W6G23DY6XCGM75MULMQ` |
+| `policy_engine` | `CCOP7NRMST5K6TL7FBDMX25LDEPW3DSFBOGBIKVFIDNAAZY7GBMVP3M4` |
+| `intent_registry` | `CAFIATSIZQSBILZJWVT4PVDXPVITJHLP6LPAVKDRHCA7I7XPZSLTRPUS` |
+| `recovery_manager` | `CCHC4YKVYS3CAZUOUYWYTEMQ6TZDW75WB2BGENUC2CDWDX5RH7NMKZWU` |
+| `transfer_adapter` | `CBRYGIR3ORDW5LE6J7AVPSKRNTMRUYHD6FVPHQMJGPQLQ5FQUZ2U6GFH` |
+| `split_adapter` | `CBQA7UI7QN6RN4IZT7WPDHWTK2OO7J4FH2KMCVJGKMKVFGDURD63UQ7U` |
+
+Configured identically to §6: `policy_engine` rules, guardian registered, `smart_account` authorized on the `STA` SAC and funded with `1,000,000,000`.
+
+### 13.3 Payments re-tested — including the one that used to fail
+
+Transfer and split, exactly as §7.1–§7.2, now with **no `SAC.transfer` sub-invocation declared at all** (the simplified script — §12):
+
+| Call | Transaction |
+|---|---|
+| `execute_transfer_payment` (5,000,000 to recipient 1) | [`e9acc126...`](https://stellar.expert/explorer/testnet/tx/e9acc126c0a0612b6ae4fe3472a85aa1a9da18122067facd1c93a020b4df3b28) |
+| `execute_split_payment` (2,000,000 / 3,000,000) | [`a97d05f0...`](https://stellar.expert/explorer/testnet/tx/a97d05f0d9585444054e8f8217e42f701f572728d6a2f172652b8328baa467ab) |
+| `create_scheduled_payment` (1,000,000, single execution) | [`b3a00fbe...`](https://stellar.expert/explorer/testnet/tx/b3a00fbebeb595345f4ed4b34ccd556e07675130b68b8cf23076695f72c38808) |
+
+Then the call that failed in §8, unchanged in every argument, run again against the fixed code:
+
+```
+$ stellar contract invoke --id CD6GY4UUTNPW4TUV7LDL5SELN4BBHJG4KDDT3W6G23DY6XCGM75MULMQ --source sta-testnet-relayer --network testnet -- \
+  execute_scheduled_payment --intent_id ad961b1c... --child_sequence 1
+```
+✅ [`16608966...`](https://stellar.expert/explorer/testnet/tx/16608966fd79f94f8f76e1943e88b91cab2c88fb8dd786dbabb8d64e5d5da81c) — **succeeds**, with only the relayer's own `intent_registry.mark_child_executed` authorization entry; no `smart_account` entry of any kind is needed any more (`scripts/execute_scheduled_payment_as_relayer.py`, simplified — §12).
+
+Balance and allowance evidence, not just a success status code:
+
+| | Before this section | After |
+|---|---|---|
+| `smart_account` STA balance | `1,000,000,000` (freshly funded) | `988,000,000` (`-5,000,000` transfer `-5,000,000` split `-1,000,000` scheduled `-1,000,000` a second transfer rejection-demo control call — exactly accounted for) |
+| `smart_account → transfer_adapter` SAC allowance | `0` | `0` — the `approve_adapter` grant was for the exact amount moved and fully consumed by `transfer_from` in the same transaction, nothing left outstanding |
+
+The two rejected-payment demonstrations (§9) were re-run on this treasury too — `nonce = 1` replay (`Error(Contract, #8005)`) and an over-cap amount (`Error(Contract, #2005)`) — both still reject exactly as before; the fix changed *how* funds move, not the policy/replay guarantees around it.
+
+### 13.4 Verification
+
+`cargo build --workspace`, `cargo test --workspace` (164 passed, 0 failed — two `transfer_adapter`/`split_adapter` unit tests updated to grant the same allowance `smart_account` now grants in the real flow; `mock_all_auths()` cannot exercise the reentrancy this fix closes, so the real proof is §13.3 above, not a new unit test), `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --all -- --check` all clean after the fix. See `docs/SECURITY_REVIEW_STRICT.md` finding 29 for the full writeup.

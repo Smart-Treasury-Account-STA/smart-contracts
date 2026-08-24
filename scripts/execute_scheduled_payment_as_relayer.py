@@ -5,42 +5,34 @@ relayer identity, on Stellar testnet.
 `execute_scheduled_payment` itself has no `require_auth()` gate on
 `smart_account` (it is deliberately permissionless -- see that function's
 doc comment in `contracts/smart_account/src/lib.rs`: "the signer approval
-already happened at `create_scheduled_payment` time"). But that does NOT
-mean the whole call graph needs no authorization at execution time.
-Building this script empirically surfaced two real, independent
-authorization points, not one:
+already happened at `create_scheduled_payment` time"). The only real
+authorization anywhere in this call graph is
+`intent_registry::ensure_executor`'s `executor.require_auth()`, two levels
+deep (`execute_scheduled_payment -> intent_registry.mark_child_executed ->
+ensure_executor`). Soroban's `SourceAccount` credentials (what the bare
+`stellar contract invoke --source <id>` CLI auto-generates) only cover
+`require_auth()` calls made at the ROOT of the invocation tree; a non-root
+call -- even by a plain Ed25519 account, not a custom account -- needs an
+explicit `SorobanCredentialsType.SOROBAN_CREDENTIALS_ADDRESS` entry with
+its own real signature over that exact sub-invocation (confirmed
+empirically: the bare CLI rejects this call with `Error(Auth,
+InvalidAction)` / "encountered authorization not tied to the root contract
+invocation for an address"). That is the one entry this script builds.
 
-1. `intent_registry::ensure_executor`'s `executor.require_auth()`, two
-   levels deep (`execute_scheduled_payment -> intent_registry
-   .mark_child_executed -> ensure_executor`). Soroban's `SourceAccount`
-   credentials (what the bare `stellar contract invoke --source <id>` CLI
-   auto-generates) only cover `require_auth()` calls made at the ROOT of
-   the invocation tree; a non-root call -- even by a plain Ed25519
-   account, not a custom account -- needs an explicit
-   `SorobanCredentialsType.SOROBAN_CREDENTIALS_ADDRESS` entry with its own
-   real signature over that exact sub-invocation (confirmed empirically:
-   the bare CLI rejects this call with `Error(Auth, InvalidAction)` /
-   "encountered authorization not tied to the root contract invocation for
-   an address").
-2. The Stellar Asset Contract's own `transfer(from, to, amount)`, which
-   internally calls `from.require_auth()` where `from = smart_account`.
-   `smart_account` is never the *direct* caller of the SAC here
-   (`transfer_adapter` is -- `smart_account` only calls `transfer_adapter`,
-   two levels above the SAC), so Soroban's invoker-contract shortcut never
-   applies to it, exactly the same empirical finding
-   `execute_demo_transfer_payment.py`'s docstring already documents for
-   the interactive transfer path. Because `execute_scheduled_payment` has
-   no top-level `smart_account.require_auth()` call to root this entry
-   under (unlike the interactive path), this entry's `root_invocation` is
-   the SAC `transfer` call itself -- and it still needs the full custom
-   `AuthPayload`/`do_check_auth` treatment (context rule + a real signer
-   signature covering the nested `__check_auth` call), because
-   `smart_account` is a custom account and this is a genuine, freestanding
-   `require_auth()` on it, not merely a formality. In short: an "already
-   approved" scheduled payment's *relayer* dispatch needs no signer key,
-   but the token movement it triggers still does, at execution time -- the
-   signer's role at `create_scheduled_payment` time approves the
-   schedule's terms, not the individual on-chain movement of funds.
+Earlier revisions of this script also had to build a second and third
+entry for `smart_account`'s own custom `AuthPayload`, because the adapter
+used to call the SAC's plain `transfer(from=smart_account, ...)`, which
+needs `smart_account.require_auth()` again -- and since
+`execute_scheduled_payment` never opens a root authorization session for
+`smart_account`, that second authentication attempt was a genuine Soroban
+contract-reentrancy violation (`smart_account`'s own frame was already
+active on the stack). See `docs/SECURITY_REVIEW_STRICT.md` finding 29.
+Fixed by having `smart_account` `approve` the adapter for the exact amount
+immediately before delegating to it (invoker-shortcut, no `__check_auth`
+call at all) and having the adapter draw via `transfer_from` instead of
+`transfer` (also invoker-shortcut, this time on the adapter's own
+address). Neither call needs an authorization entry any more, so this
+script only ever needs the relayer's own entry below.
 """
 from __future__ import annotations
 
@@ -93,34 +85,6 @@ def signature_payload(invocation: stellar_xdr.SorobanAuthorizedInvocation, nonce
     return hashlib.sha256(preimage.to_xdr_bytes()).digest()
 
 
-def classic_address_entry(
-    kp: Keypair, invocation: stellar_xdr.SorobanAuthorizedInvocation, expiration_ledger: int
-) -> tuple[stellar_xdr.SorobanAuthorizationEntry, int]:
-    nonce = random.getrandbits(62)
-    sig_payload = signature_payload(invocation, nonce, expiration_ledger)
-    raw_sig = kp.sign(sig_payload)
-    classic_sig_scval = scval.to_vec(
-        [
-            scval.to_map(
-                {
-                    scval.to_symbol("public_key"): scval.to_bytes(kp.raw_public_key()),
-                    scval.to_symbol("signature"): scval.to_bytes(raw_sig),
-                }
-            )
-        ]
-    )
-    credentials = stellar_xdr.SorobanCredentials(
-        type=stellar_xdr.SorobanCredentialsType.SOROBAN_CREDENTIALS_ADDRESS,
-        address=stellar_xdr.SorobanAddressCredentials(
-            address=Address(kp.public_key).to_xdr_sc_address(),
-            nonce=stellar_xdr.Int64(nonce),
-            signature_expiration_ledger=stellar_xdr.Uint32(expiration_ledger),
-            signature=classic_sig_scval,
-        ),
-    )
-    return stellar_xdr.SorobanAuthorizationEntry(credentials=credentials, root_invocation=invocation), nonce
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--smart-account", required=True)
@@ -128,17 +92,10 @@ def main() -> int:
     parser.add_argument("--intent-id-hex", required=True)
     parser.add_argument("--child-sequence", type=int, required=True)
     parser.add_argument("--relayer-identity", default="sta-testnet-relayer")
-    parser.add_argument("--asset", required=True, help="SAC contract ID pinned on the intent")
-    parser.add_argument("--destination", required=True, help="Destination pinned on the intent")
-    parser.add_argument("--amount", type=int, required=True, help="Amount pinned on the intent")
-    parser.add_argument("--owner-identity", default="sta-testnet-factory-owner")
-    parser.add_argument("--context-rule-id", type=int, default=0)
     args = parser.parse_args()
 
     relayer_secret = stellar_secret(args.relayer_identity)
     relayer_kp = Keypair.from_secret(relayer_secret)
-    owner_secret = stellar_secret(args.owner_identity)
-    owner_kp = Keypair.from_secret(owner_secret)
 
     server = SorobanServer(RPC_URL)
     latest_ledger = server.get_latest_ledger().sequence
@@ -147,55 +104,31 @@ def main() -> int:
     intent_id = bytes.fromhex(args.intent_id_hex)
     call_args = [scval.to_bytes(intent_id), scval.to_uint32(args.child_sequence)]
 
-    # Entry 1: relayer authorizes intent_registry.mark_child_executed
-    # (rooted there directly -- no smart_account require_auth() gate
-    # exists above it to nest under).
-    mark_executed_invocation = contract_fn_invocation(args.intent_registry, "mark_child_executed", call_args)
-    entry1, _ = classic_address_entry(relayer_kp, mark_executed_invocation, expiration_ledger)
+    nested_invocation = contract_fn_invocation(args.intent_registry, "mark_child_executed", call_args)
+    nonce = random.getrandbits(62)
+    sig_payload = signature_payload(nested_invocation, nonce, expiration_ledger)
+    raw_sig = relayer_kp.sign(sig_payload)
 
-    # Entry 2: smart_account's custom AuthPayload, rooted at the SAC's own
-    # transfer(from=smart_account, ...) call -- the only place
-    # smart_account.require_auth() is actually invoked in this call graph
-    # (see module docstring point 2).
-    sac_invocation = contract_fn_invocation(
-        args.asset,
-        "transfer",
-        [scval.to_address(args.smart_account), scval.to_address(args.destination), scval.to_int128(args.amount)],
+    classic_sig_scval = scval.to_vec(
+        [
+            scval.to_map(
+                {
+                    scval.to_symbol("public_key"): scval.to_bytes(relayer_kp.raw_public_key()),
+                    scval.to_symbol("signature"): scval.to_bytes(raw_sig),
+                }
+            )
+        ]
     )
-    nonce2 = random.getrandbits(62)
-    sig_payload2 = signature_payload(sac_invocation, nonce2, expiration_ledger)
-    context_rule_ids_scval = scval.to_vec([scval.to_uint32(args.context_rule_id)])
-    auth_digest = hashlib.sha256(sig_payload2 + context_rule_ids_scval.to_xdr_bytes()).digest()
-
-    signer_scval = scval.to_enum("Delegated", scval.to_address(owner_kp.public_key))
-    signers_map_scval = stellar_xdr.SCVal(
-        type=stellar_xdr.SCValType.SCV_MAP,
-        map=stellar_xdr.SCMap(
-            sc_map=[stellar_xdr.SCMapEntry(key=signer_scval, val=scval.to_bytes(b""))]
-        ),
-    )
-    auth_payload_scval = scval.to_struct(
-        {"signers": signers_map_scval, "context_rule_ids": context_rule_ids_scval}
-    )
-    credentials2 = stellar_xdr.SorobanCredentials(
+    credentials = stellar_xdr.SorobanCredentials(
         type=stellar_xdr.SorobanCredentialsType.SOROBAN_CREDENTIALS_ADDRESS,
         address=stellar_xdr.SorobanAddressCredentials(
-            address=Address(args.smart_account).to_xdr_sc_address(),
-            nonce=stellar_xdr.Int64(nonce2),
+            address=Address(relayer_kp.public_key).to_xdr_sc_address(),
+            nonce=stellar_xdr.Int64(nonce),
             signature_expiration_ledger=stellar_xdr.Uint32(expiration_ledger),
-            signature=auth_payload_scval,
+            signature=classic_sig_scval,
         ),
     )
-    entry2 = stellar_xdr.SorobanAuthorizationEntry(credentials=credentials2, root_invocation=sac_invocation)
-
-    # Entry 3: owner's classic signature over the nested
-    # smart_account.__check_auth(auth_digest) call authenticate() makes.
-    check_auth_invocation = contract_fn_invocation(
-        args.smart_account, "__check_auth", [scval.to_bytes(auth_digest)]
-    )
-    entry3, _ = classic_address_entry(owner_kp, check_auth_invocation, expiration_ledger)
-
-    auth_entries = [entry1, entry2, entry3]
+    auth_entry = stellar_xdr.SorobanAuthorizationEntry(credentials=credentials, root_invocation=nested_invocation)
 
     source_account = server.load_account(relayer_kp.public_key)
     tx = (
@@ -205,7 +138,7 @@ def main() -> int:
             contract_id=args.smart_account,
             function_name="execute_scheduled_payment",
             parameters=call_args,
-            auth=auth_entries,
+            auth=[auth_entry],
         )
         .build()
     )

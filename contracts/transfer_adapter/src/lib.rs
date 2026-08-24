@@ -16,10 +16,29 @@
 //! cannot swap the token, destination, or amount between wallet simulation
 //! and submission; doing so produces a different tree node with no matching
 //! authorization.
+//!
+//! Security review finding (`docs/SECURITY_REVIEW_STRICT.md` finding 29):
+//! this used to call the SAC's plain `transfer(from=smart_account, ...)`,
+//! which requires `smart_account.require_auth()` *again*, independently of
+//! the check above — fine when `smart_account`'s own top-level entrypoint
+//! already opened an authorization session covering this exact node (the
+//! interactive payment path), but impossible for a permissionless
+//! entrypoint that never authenticates `smart_account` at all
+//! (`execute_scheduled_payment`): by the time this call is reached,
+//! `smart_account`'s own frame is already active on the call stack, so
+//! asking the host to invoke its `__check_auth` again is genuine contract
+//! reentrancy, which Soroban rejects outright. `smart_account` now
+//! `approve`s this adapter for the exact amount immediately before calling
+//! it (satisfied by the invoker-shortcut, since `smart_account` is the
+//! SAC's direct caller for that `approve` — no `__check_auth` invocation
+//! at all, so no reentrancy risk), and this adapter draws via
+//! `transfer_from` instead of `transfer`: `transfer_from`'s authorization
+//! is on `spender` (this adapter's own address), which is *this contract's*
+//! invoker-shortcut to claim, not `smart_account`'s.
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, symbol_short, token::TokenClient,
-    Address, Env, MuxedAddress, Symbol,
+    Address, Env, Symbol,
 };
 
 /// See `docs/TECHNICAL_ARCHITECTURE.md` §16 ("Production requirement").
@@ -122,8 +141,12 @@ impl TransferAdapter {
         }
 
         let token_client = TokenClient::new(&env, &token);
-        let to_muxed: MuxedAddress = to.clone().into();
-        token_client.transfer(&smart_account, &to_muxed, &amount);
+        token_client.transfer_from(
+            &env.current_contract_address(),
+            &smart_account,
+            &to,
+            &amount,
+        );
 
         TransferExecuted { token, to, amount }.publish(&env);
         Ok(())

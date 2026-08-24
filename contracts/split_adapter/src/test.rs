@@ -29,6 +29,17 @@ fn splits_balance_across_recipients_by_index() {
     let alice = Address::generate(&e);
     let bob = Address::generate(&e);
     StellarAssetClient::new(&e, &token).mint(&smart_account, &1_000);
+    let token_client = TokenClient::new(&e, &token);
+    // In the real flow, smart_account grants this allowance itself
+    // (`approve_adapter` in contracts/smart_account/src/lib.rs) immediately
+    // before calling execute_split -- see docs/SECURITY_REVIEW_STRICT.md
+    // finding 29.
+    token_client.approve(
+        &smart_account,
+        &client.address,
+        &1_000,
+        &e.ledger().sequence(),
+    );
 
     client.execute_split(
         &token,
@@ -36,7 +47,6 @@ fn splits_balance_across_recipients_by_index() {
         &vec![&e, 300, 700],
     );
 
-    let token_client = TokenClient::new(&e, &token);
     assert_eq!(token_client.balance(&smart_account), 0);
     assert_eq!(token_client.balance(&alice), 300);
     assert_eq!(token_client.balance(&bob), 700);

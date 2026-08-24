@@ -7,10 +7,17 @@
 //! address, so the exact token/recipients/amounts are cryptographically
 //! part of what was signed — a caller cannot add, remove, or resize a
 //! recipient after the signer approved the split.
+//!
+//! Draws via `transfer_from`, not the SAC's plain `transfer` — see
+//! `transfer_adapter`'s module doc comment and
+//! `docs/SECURITY_REVIEW_STRICT.md` finding 29 for why: `smart_account`
+//! `approve`s this adapter for the exact total immediately before calling
+//! it (invoker-shortcut, no reentrancy), and this adapter's own address is
+//! the `spender` `transfer_from` actually authenticates.
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, symbol_short, token::TokenClient,
-    Address, Env, MuxedAddress, Symbol, Vec,
+    Address, Env, Symbol, Vec,
 };
 
 const MAX_RECIPIENTS: u32 = 20;
@@ -123,9 +130,9 @@ impl SplitAdapter {
         }
 
         let token_client = TokenClient::new(&env, &token);
+        let adapter = env.current_contract_address();
         for (recipient, amount) in recipients.iter().zip(amounts.iter()) {
-            let to_muxed: MuxedAddress = recipient.clone().into();
-            token_client.transfer(&smart_account, &to_muxed, &amount);
+            token_client.transfer_from(&adapter, &smart_account, &recipient, &amount);
         }
 
         SplitExecuted {

@@ -11,18 +11,19 @@ those scripts' docstrings for the full `AuthPayload`/`do_check_auth`/
 `authenticate` explanation), generalized here to one script covering all
 four `smart_account` entrypoints that gate on
 `env.current_contract_address().require_auth()`, rather than duplicating
-the ~150 lines of auth-entry plumbing per call shape. What differs between
-the four call types is only:
-  1. the function name and its ordinary (non-auth) call_args, and
-  2. the root invocation's `sub_invocations`: `transfer`/`split` each
-     declare one `SAC.transfer(from=smart_account, ...)` sub-invocation per
-     moved balance (the adapter's own `smart_account.require_auth()` is
-     always invoker-shortcut-satisfied and never needs a node); the two
-     `*_scheduled_payment` calls declare none at all, since
-     `intent_registry`'s `admin.require_auth()` is satisfied the same
-     invoker-shortcut way (`admin == smart_account == intent_registry`'s
-     direct caller) -- see `create_scheduled_payment`'s doc comment in
-     `contracts/smart_account/src/lib.rs`.
+the ~150 lines of auth-entry plumbing per call shape. All four need only
+the root entry (`smart_account`'s own `AuthPayload` for the top-level
+call), with an empty `sub_invocations` list -- no declared SAC node at
+all: `transfer_adapter`/`split_adapter` now draw funds via `transfer_from`
+(the SAC's `spender` authorization, satisfied by *their own*
+invoker-shortcut, not `smart_account`'s) after `smart_account` `approve`s
+them for the exact amount immediately beforehand (also invoker-shortcut,
+since `smart_account` is the SAC's direct caller for `approve`) -- see
+`docs/SECURITY_REVIEW_STRICT.md` finding 29. Earlier revisions of this
+script declared one `SAC.transfer(from=smart_account, ...)` sub-invocation
+per moved balance for `transfer`/`split`, back when the adapters called
+the SAC's plain `transfer` directly; that node no longer exists in the
+real call graph.
 """
 from __future__ import annotations
 
@@ -166,14 +167,6 @@ def build_auth_entries(
     return [entry1, entry2]
 
 
-def sac_transfer_invocation(asset: str, smart_account: str, destination: str, amount: int):
-    return contract_fn_invocation(
-        asset,
-        "transfer",
-        [scval.to_address(smart_account), scval.to_address(destination), scval.to_int128(amount)],
-    )
-
-
 def scheduled_intent_args_scval(
     intent_id: bytes,
     asset: str,
@@ -283,7 +276,7 @@ def main() -> int:
             scval.to_uint64(args.nonce),
             scval.to_uint32(args.expected_policy_version),
         ]
-        sub_invocations = [sac_transfer_invocation(args.asset, args.smart_account, args.destination, args.amount)]
+        sub_invocations = []
         function_name = "execute_transfer_payment"
 
     elif args.call == "split":
@@ -296,10 +289,7 @@ def main() -> int:
             scval.to_uint64(args.nonce),
             scval.to_uint32(args.expected_policy_version),
         ]
-        sub_invocations = [
-            sac_transfer_invocation(args.asset, args.smart_account, r, a)
-            for r, a in zip(recipients, amounts)
-        ]
+        sub_invocations = []
         function_name = "execute_split_payment"
 
     elif args.call == "create_scheduled":
