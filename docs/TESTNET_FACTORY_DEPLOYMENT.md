@@ -459,3 +459,43 @@ The two rejected-payment demonstrations (§9) were re-run on this treasury too �
 ### 13.4 Verification
 
 `cargo build --workspace`, `cargo test --workspace` (164 passed, 0 failed — two `transfer_adapter`/`split_adapter` unit tests updated to grant the same allowance `smart_account` now grants in the real flow; `mock_all_auths()` cannot exercise the reentrancy this fix closes, so the real proof is §13.3 above, not a new unit test), `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --all -- --check` all clean after the fix. See `docs/SECURITY_REVIEW_STRICT.md` finding 29 for the full writeup.
+
+## 14. Guardian freeze and recovery, end to end — a throwaway, reduced-timelock test build
+
+Everything above ran against the real, reviewed contracts, delays and all. `recovery_manager`'s guardian-activation (`GUARDIAN_ACTIVATION_DELAY_LEDGERS`), recovery-finalization (`MIN_RECOVERY_DELAY_LEDGERS`), and guardian-threshold-change (`GUARDIAN_CHANGE_DELAY_LEDGERS`) delays, plus `smart_account`'s adapter-change delay (`ADAPTER_CHANGE_DELAY_LEDGERS`), are each ~17,280 ledgers (~1 day at 5s close time) — hardcoded `const`s, not admin-configurable, not something a real testnet run can wait out inside one session. To actually exercise the guardian-freeze and recovery entrypoints on live testnet rather than only in `mock_all_auths()`-based local tests, this section used a **separate, throwaway test build** with those four constants temporarily set to `5` ledgers (~25s) instead of `17280`, deployed as its own treasury under distinct WASM hashes — **never the hashes the repo's `wasm_fixtures` track, and never what any real deployment should use.** The source edit was made, built, deployed, exercised, then reverted (`git checkout`) before anything here was written up or committed; a rebuild afterward reproduced the exact committed WASM hashes byte-for-byte (`0eb4038e...` / `886bcd31...`), confirming the real contracts were untouched.
+
+**Why this is safe to record here without weakening anything real:** `account_factory` itself was never redeployed for this — its whole purpose is exactly this kind of pointer indirection. `set_wasm_hashes` was pointed at the reduced-delay build for the one `deploy_account` call below, then pointed straight back at the real, full-delay hashes immediately after — [`54f67149...`](https://stellar.expert/explorer/testnet/tx/54f67149d23dce1de345ad7e0fcbed31cc36ce5037136c8292231b89b26ba82e) restores it. Every other treasury this document describes (§5, §13.2), and any future `deploy_account` call, was and is built from the real 17,280-ledger delays.
+
+### 14.1 Throwaway treasury, reduced delays
+
+Same `deploy_account` flow, third treasury: [`11733f62...`](https://stellar.expert/explorer/testnet/tx/11733f62d8ac360038860ce03ed467b24da3e57c8e8439243ff12729c39ff9cf) — `smart_account = CDBRWF43RRJQKBGVCH6PGXQXT54YRHNUNOOB42EY2QAKVRF6PRPYKPJK`, `recovery_manager = CDUTVUO3SJDRMKVGJ67TUX33PWSIRYJZXYDTQPJSTBRI6XGKNE3ATJ2V`. Configured identically to §6/§13.2 (policy rules, `STA` authorized and funded with `1,000,000,000`), plus `add_guardian` for `sta-testnet-guardian` ([`20286d23...`](https://stellar.expert/explorer/testnet/tx/20286d23bec9cc6caf5e9f927a6d2ce820dc30e5933ef84e25303ee800d24f3d)) and a fresh identity, `sta-testnet-recovered-owner`, to serve as the recovery-replacement owner/signer.
+
+### 14.2 Guardian-triggered freeze
+
+| Call | Transaction | Result |
+|---|---|---|
+| `recovery_manager.request_guardian_freeze` (guardian, once active) | [`979a0a0e...`](https://stellar.expert/explorer/testnet/tx/979a0a0e6ea95bc7d254c2c61dd14e48b7c086f1e6ab43e972fc0c477f4ced52) | `GuardianFreezeRequested` — freeze epoch advances |
+| `smart_account.apply_guardian_freeze` (permissionless) | [`b2e1faed...`](https://stellar.expert/explorer/testnet/tx/b2e1faed24c99c62c045ef0f61ae558152283f982e7f183a510c7152dc51ffac) | `Frozen(triggered_by_guardian: true)`; `status()` confirms `frozen: true` |
+
+A signer-authorized transfer attempt against the frozen treasury was rejected with `Error(Contract, #8003)` (`Frozen`) — the same policy-independent fail-closed behavior §7/§13.3 already proved for the unfrozen case, now proved for the frozen one.
+
+### 14.3 Full recovery, replacing owner and signers
+
+| Call | Transaction | Result |
+|---|---|---|
+| `recovery_manager.open_recovery` (guardian, `replacement_owner`/`replacement_signers` = `sta-testnet-recovered-owner`) | [`3884ebe4...`](https://stellar.expert/explorer/testnet/tx/3884ebe43592653624839226cbc4b2bf608cf9d972a287e1b856b45811f35280) | `RecoveryOpened` |
+| `recovery_manager.approve_recovery` (guardian; threshold = 1, so this alone suffices) | [`35e61125...`](https://stellar.expert/explorer/testnet/tx/35e611255c435b1c88d0004fea654758df8c31e2d06682ba49956fe433bf9213) | `RecoveryApproved` |
+| `recovery_manager.finalize_recovery` (permissionless, once threshold + timelock met) | [`e6a46c31...`](https://stellar.expert/explorer/testnet/tx/e6a46c3171c7e7a414138aa2fbf1ec714baf9bd9ad3fa2d946ba3a327483d324) | `RecoveryFinalized` |
+| `smart_account.apply_recovery` (permissionless) | [`ff0e957f...`](https://stellar.expert/explorer/testnet/tx/ff0e957f35622c8c410315ec4728db87b1cfec47d9e9d218642098ed0cacd33e) | `SignerDeregistered(0)`, `ContextRuleRemoved(0)`, `SignerRegistered(1, recovered-owner)`, `ContextRuleAdded(1, "recovered")`, `RecoveryApplied` — `status()` confirms `frozen: false`, `get_owner()` returns the new owner |
+
+Proof it's a real, load-bearing replacement, not just an event: a payment signed by the **new** owner under context rule `1` succeeded ([`6e94dfc6...`](https://stellar.expert/explorer/testnet/tx/6e94dfc64305ba36521c9111c5cb94cdd9176c47586b8e348d54af877d2bdfe8)); the identical call re-signed by the **old**, pre-recovery owner under context rule `0` failed simulation outright (`Error(Auth, InvalidAction)` — `__check_auth` itself errors with OZ's `#3000`, since that signer/context rule no longer exists). This is the exact guarantee finding 12 (recovery restoring spend authority, not just `Ownable`'s `owner`) set out to prove, now demonstrated live rather than only in `mock_all_auths()` tests.
+
+### 14.4 Guardian threshold change
+
+`recovery_manager.propose_threshold_change(1)` ([`d11cde77...`](https://stellar.expert/explorer/testnet/tx/d11cde77a1668f0b43062ff9173edd6d6eb59a1edce33d381d13639e4a671183)) then, once the (shortened) timelock elapsed, `apply_threshold_change` ([`0c05b486...`](https://stellar.expert/explorer/testnet/tx/0c05b4868ebe89bbce874104a6c8716cc9c966fc3a8f7632a3c700acf3643b55)) — `ThresholdChanged(new_threshold: 1)`.
+
+### 14.5 Cleanup and re-verification
+
+Source reverted (`git checkout -- contracts/recovery_manager/src/lib.rs contracts/smart_account/src/lib.rs`), rebuilt, and diffed byte-for-byte against the pre-edit hashes — identical. `account_factory.set_wasm_hashes` restored to the real values ([`54f67149...`](https://stellar.expert/explorer/testnet/tx/54f67149d23dce1de345ad7e0fcbed31cc36ce5037136c8292231b89b26ba82e)). Full verification quartet (`cargo build`/`test`/`clippy`/`fmt`) re-run clean on the reverted tree — see the commit history for this document's own change for the exact run.
+
+Adapter-change propose/apply was not separately re-tested in this section (already proven live in `docs/TESTNET_DEPLOYMENT.md` §5 on the original manual deployment, under the real ~1 day delay); `ADAPTER_CHANGE_DELAY_LEDGERS` was reduced alongside the other three purely so the throwaway build stayed internally consistent, not because it was separately exercised here.
