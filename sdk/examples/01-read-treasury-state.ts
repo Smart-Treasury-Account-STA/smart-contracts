@@ -14,14 +14,18 @@ import {
 async function main() {
   const net = TESTNET;
 
-  const status = await readAccountStatus(net);
+  // Independent reads -- run concurrently rather than paying each
+  // simulation's RPC latency serially.
+  const [status, owner, ruleCount, policyVersion] = await Promise.all([
+    readAccountStatus(net),
+    readOwner(net),
+    readContextRulesCount(net),
+    readPolicyVersion(net),
+  ]);
   console.log("status:", status);
-
-  const owner = await readOwner(net);
   console.log("owner:", owner);
-
-  const ruleCount = await readContextRulesCount(net);
   console.log("context rule count:", ruleCount);
+  console.log("policy version:", policyVersion);
 
   for (let id = 0; id < ruleCount; id++) {
     try {
@@ -31,9 +35,6 @@ async function main() {
       console.log(`context rule ${id}: not found (removed)`);
     }
   }
-
-  const policyVersion = await readPolicyVersion(net);
-  console.log("policy version:", policyVersion);
 }
 
 main().catch((err) => {

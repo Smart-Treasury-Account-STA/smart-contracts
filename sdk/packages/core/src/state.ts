@@ -13,44 +13,38 @@ import type { NetworkConfig } from "./config.js";
 
 export type { AccountStatus, ContextRule, ScheduledIntent, RecoveryRequest, WasmHashes };
 
+interface ClientCtorOptions {
+  contractId: string;
+  networkPassphrase: string;
+  rpcUrl: string;
+}
+
+/** Every generated `Client` constructor takes the same
+ * `{ contractId, networkPassphrase, rpcUrl }` shape -- this is the one
+ * place that assembles it, so the five `*Client` factories below are each
+ * a one-liner naming which contract address and class to use. */
+function makeClient<T>(Ctor: new (opts: ClientCtorOptions) => T, contractId: string, net: NetworkConfig): T {
+  return new Ctor({ contractId, networkPassphrase: net.networkPassphrase, rpcUrl: net.rpcUrl });
+}
+
 export function smartAccountClient(net: NetworkConfig): SmartAccountClient {
-  return new SmartAccountClient({
-    contractId: net.contracts.smartAccount,
-    networkPassphrase: net.networkPassphrase,
-    rpcUrl: net.rpcUrl,
-  });
+  return makeClient(SmartAccountClient, net.contracts.smartAccount, net);
 }
 
 export function policyEngineClient(net: NetworkConfig): PolicyEngineClient {
-  return new PolicyEngineClient({
-    contractId: net.contracts.policyEngine,
-    networkPassphrase: net.networkPassphrase,
-    rpcUrl: net.rpcUrl,
-  });
+  return makeClient(PolicyEngineClient, net.contracts.policyEngine, net);
 }
 
 export function intentRegistryClient(net: NetworkConfig): IntentRegistryClient {
-  return new IntentRegistryClient({
-    contractId: net.contracts.intentRegistry,
-    networkPassphrase: net.networkPassphrase,
-    rpcUrl: net.rpcUrl,
-  });
+  return makeClient(IntentRegistryClient, net.contracts.intentRegistry, net);
 }
 
 export function recoveryManagerClient(net: NetworkConfig): RecoveryManagerClient {
-  return new RecoveryManagerClient({
-    contractId: net.contracts.recoveryManager,
-    networkPassphrase: net.networkPassphrase,
-    rpcUrl: net.rpcUrl,
-  });
+  return makeClient(RecoveryManagerClient, net.contracts.recoveryManager, net);
 }
 
 export function accountFactoryClient(net: NetworkConfig): AccountFactoryClient {
-  return new AccountFactoryClient({
-    contractId: net.contracts.accountFactory,
-    networkPassphrase: net.networkPassphrase,
-    rpcUrl: net.rpcUrl,
-  });
+  return makeClient(AccountFactoryClient, net.contracts.accountFactory, net);
 }
 
 /** `smart_account.status()` -- check before offering any payment action; a

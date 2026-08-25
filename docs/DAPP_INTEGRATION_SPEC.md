@@ -24,21 +24,24 @@ signature scheme; it is out of scope here and left for a later tranche.
 
 ## 1. System overview
 
-Seven contracts, composed rather than each reimplementing the same
+Eight contracts, composed rather than each reimplementing the same
 primitives:
 
 | Contract | Role | Auth model exposed to a client |
 |---|---|---|
 | `smart_account` | Treasury root. Owns funds indirectly via adapters, decides what payments/schedules are approved. | **Custom account** — see §5. Every fund-moving or schedule-creating call requires this. |
-| `policy_engine` | Asset/recipient/operation allowlists, amount caps, versioned policy state. | None for reads (`validate_policy`, `version` are permissionless). Admin-gated for writes — out of dApp scope for Tranche 2 (configured by the treasury operator via CLI/ops tooling, not the payment UI). |
+| `account_factory` | Deploys and wires a complete treasury (all six other contracts below except `webauthn_verifier`) in one call. | Plain `caller.require_auth()` — a root-level address requirement, not `smart_account`'s custom `AuthPayload`. See §12. |
+| `policy_engine` | Asset/recipient/operation allowlists, amount caps, versioned policy state. | None for reads (`validate_policy`, `version` are permissionless). Admin-gated for writes — out of dApp scope for Tranche 2 (configured by the treasury operator via CLI/ops tooling, not the payment UI), except the one-time `admin` assignment at deployment — see §12. |
 | `intent_registry` | Canonical scheduled-payment state, execution windows, exactly-once child execution. | Admin-gated writes (admin = `smart_account`, satisfied by sub-invocation — see §7). Executor-gated `mark_child_executed` (a plain relayer key — see §8). |
-| `recovery_manager` | Guardian quorum, timelocked recovery/guardian administration. | Out of Tranche 2 scope; noted for completeness in §9. |
+| `recovery_manager` | Guardian quorum, timelocked recovery/guardian administration. | Guardian *administration* (`add_guardian` during initial setup) is in scope — see §12. The operational recovery flows (`open_recovery`, `approve_recovery`, `finalize_recovery`) remain out of Tranche 2 scope; noted for completeness in §9. |
 | `transfer_adapter` / `split_adapter` | Narrow, preauthorized SAC transfer execution. Never called directly by a client — only reachable through `smart_account`. | N/A — not a client integration point. |
 | `webauthn_verifier` | Passkey/secp256r1 signature verification for `Signer::External`. | Out of scope here (see above). |
 
-A client only ever calls into `smart_account` (for anything that moves
-funds or schedules a payment) and `policy_engine` (for read-only
-pre-checks). It never calls the adapters or `intent_registry` directly.
+A client calls into `smart_account` (for anything that moves funds or
+schedules a payment), `policy_engine` (for read-only pre-checks), and now
+`account_factory` (for deploying a new treasury — §12). It never calls the
+adapters or `intent_registry` directly, and does not call `policy_engine`
+or `recovery_manager` for anything beyond §12's one-time deployment setup.
 
 ## 2. Environment setup
 
@@ -56,22 +59,31 @@ pre-checks). It never calls the adapters or `intent_registry` directly.
   `signAuthEntry()` surface across both wallets — build against that
   interface, not each wallet's raw API, so adding a third wallet later is
   configuration, not new integration code.
-- **Contract addresses**: read from `docs/TESTNET_DEPLOYMENT.md` §2 at
-  build time (or from a config file generated from it) — do not hardcode
-  addresses in application code, since a redeployment changes them. As of
-  the 2026-07-23 deployment:
+- **Contract addresses**: `sdk/packages/core/src/config.ts`'s `TESTNET`
+  export is the live source of truth — do not hardcode addresses in
+  application code, since a redeployment changes them (a client that
+  deploys its *own* treasury per §12 gets its own address set back from
+  `deploy_account` instead of using this shared one at all). Snapshot,
+  the account_factory-deployed treasury from
+  `docs/TESTNET_FACTORY_DEPLOYMENT.md` §13.2 (post finding-29 fix — see
+  `docs/SECURITY_REVIEW_STRICT.md`):
 
   | Contract | Address |
   |---|---|
-  | `smart_account` | `CB4KZJ3I4XANE6GWPAMXCNXQ34PTQWPXVKFBBMLNKV25GAOXQC7RQUMS` |
-  | `policy_engine` | `CC5FSUNWBNH3EIEELHO3A4ZPJZRAZCVMFNP3PVXO2YBWDNNLTFLWBVHC` |
-  | `intent_registry` | `CDHTNPBXUMPCKUJ76HQ767MDRD4IVRRH4H5DOF4JUOO36QKSV4GXFRMR` |
-  | `recovery_manager` | `CALI5XJASA66LKZPF3ZF7HOLGOFUWZYIHB6SENXCZ5Y7QVT7UQKKR6UM` |
-  | `transfer_adapter` | `CAX766XYR56WO7Y4HFOHYQUO5AIN5QLHAHKJ3DINXM2WUQY5UE7KGE26` |
-  | `split_adapter` | `CAFTFU2E4MGZT6BLCVN2FAQB6GIBJRR5ICI7C7LZEMACBDUUTQKVHHV3` |
+  | `smart_account` | `CD6GY4UUTNPW4TUV7LDL5SELN4BBHJG4KDDT3W6G23DY6XCGM75MULMQ` |
+  | `account_factory` | `CAQQTRRYNXIQGFVNCTMTBJDXW3PN7O44KPT7GWCCE4FRKTOHDBCWGUZO` |
+  | `policy_engine` | `CCOP7NRMST5K6TL7FBDMX25LDEPW3DSFBOGBIKVFIDNAAZY7GBMVP3M4` |
+  | `intent_registry` | `CAFIATSIZQSBILZJWVT4PVDXPVITJHLP6LPAVKDRHCA7I7XPZSLTRPUS` |
+  | `recovery_manager` | `CCHC4YKVYS3CAZUOUYWYTEMQ6TZDW75WB2BGENUC2CDWDX5RH7NMKZWU` |
+  | `transfer_adapter` | `CBRYGIR3ORDW5LE6J7AVPSKRNTMRUYHD6FVPHQMJGPQLQ5FQUZ2U6GFH` |
+  | `split_adapter` | `CBQA7UI7QN6RN4IZT7WPDHWTK2OO7J4FH2KMCVJGKMKVFGDURD63UQ7U` |
 
-  Confirm against `docs/TESTNET_DEPLOYMENT.md` before use — this table is a
-  snapshot, that document is the live record.
+  The original 2026-07-23 hand-deployed treasury
+  (`docs/TESTNET_DEPLOYMENT.md`) still exists and still runs the older,
+  pre-fix code — do not point new integration work at it.
+
+  Confirm against `sdk/packages/core/src/config.ts` before use — this
+  table is a snapshot, that file is the live record.
 
 ## 3. Wallet connection
 
@@ -413,18 +425,25 @@ already approved has been exhausted or not yet reached.
 
 ## 9. Explicitly out of scope for this document
 
-- `recovery_manager` guardian/recovery flows (`open_recovery`,
-  `approve_recovery`, `finalize_recovery`, guardian administration) —
-  not part of Tranche 2's dApp deliverable.
+- `recovery_manager`'s **operational** recovery flows (`open_recovery`,
+  `approve_recovery`, `finalize_recovery`) — not part of Tranche 2's dApp
+  deliverable. `add_guardian` **during initial treasury setup** is now in
+  scope — see §12.6 — this bullet covers the recovery/incident-response
+  flows specifically, not guardian registration.
 - `Signer::External` (passkey) construction — same `AuthPayload` mechanics
   as §5, different Entry B (a WebAuthn assertion verified through
   `webauthn_verifier` rather than `require_auth_for_args`).
-- Treasury bootstrapping (`smart_account.initialize`) and policy
-  configuration writes (`policy_engine.set_asset_rule` etc.) — operator/ops
-  tooling, not the payment dApp.
-- Governance actions (`propose_adapter_change`, `add_guardian`, and the
-  rest of the timelocked owner/admin surface) — see
-  `docs/GOVERNANCE_MULTISIG_DESIGN.md`.
+- Policy *content* configuration writes (`policy_engine.set_asset_rule`,
+  `set_recipient_allowed`, `set_operation_allowed`) remain operator/ops
+  tooling, not the payment dApp — treasury *bootstrapping* itself
+  (deploying the six contracts and assigning owner/admin/signer/guardian/
+  executor roles) moved into scope as of §12 and is no longer covered by
+  this bullet.
+- Post-deployment governance actions on an *already-running* treasury
+  (`propose_adapter_change`, adding/removing guardians after the initial
+  setup wizard, the rest of the timelocked owner/admin surface) — see
+  `docs/GOVERNANCE_MULTISIG_DESIGN.md`. §12 covers only the one-time setup
+  path immediately after deployment.
 
 ## 10. Reference: errors and events
 
@@ -496,9 +515,253 @@ via `stellar contract invoke --id <address> -- --help`):
 - **`policy_engine`**: `version`, `validate_policy`, `contract_name`.
 - **`intent_registry`**: `get_intent`, `is_child_executed`, `contract_name`.
 - **`recovery_manager`**: `is_guardian`, `request_status`,
-  `live_approval_count`, `guardian_freeze_requested`, `contract_name` (§9 —
-  reference only).
+  `live_approval_count`, `guardian_freeze_epoch`, `contract_name` (§9/§12 —
+  reference only; corrected from an earlier revision of this document,
+  which named a `guardian_freeze_requested` read that no longer exists —
+  see `docs/SECURITY_REVIEW_STRICT.md`'s guardian-freeze-epoch redesign).
+- **`account_factory`**: `get_wasm_hashes`, `contract_name` — see §12.
 
 Any entrypoint not listed here that appears in a given contract's
 `-- --help` output is a write path and requires the authorization model
-described in §5, §7, or §8 depending on which contract it's on.
+described in §5, §7, §8, or §12 depending on which contract it's on.
+
+## 12. Deploying and setting up a new treasury from the dApp
+
+This is the treasury-creation feature: a dApp user deploys their own
+`smart_account` (plus its five supporting contracts) and assigns its
+roles, rather than connecting to one that already exists. Everything
+below is additive to §1–§11 — the payment/scheduling/relayer flows for an
+already-deployed treasury are unchanged.
+
+### 12.1 The role model — what's fixed at deploy time vs. adjustable later
+
+This is the load-bearing constraint the whole design has to respect, and
+it comes directly from the contracts, not a policy choice this document
+is making: **`policy_engine.admin` and `recovery_manager.admin` are set
+once, at `initialize`, and there is no entrypoint on either contract that
+ever changes them again.** Verified directly against source — neither
+contract stores or exposes anything resembling `transfer_admin`.
+`transfer_adapter`/`split_adapter`'s `admin` parameter is narrower still:
+it gates their one `initialize` call and is never even persisted to
+storage afterward, so it isn't a role at all past deployment. Only
+`smart_account.owner` is genuinely mutable post-deploy, via OZ's
+`Ownable` two-step `transfer_ownership`/`accept_ownership`.
+
+| Role | Lives on | Set via | Changeable after deploy? |
+|---|---|---|---|
+| Owner | `smart_account.owner` | `caller` (Tier 1, §12.3) or `smart_account.initialize`'s `owner` (Tier 2, §12.4) | **Yes** — two-step `transfer_ownership`/`accept_ownership` |
+| Policy admin | `policy_engine.admin` | Same `caller`/`admin` as above | **No** — permanent from `initialize` |
+| Recovery admin | `recovery_manager.admin` | Same | **No** — permanent from `initialize` |
+| Adapter bootstrap admin | `transfer_adapter`/`split_adapter`'s `admin` param | Same | N/A — not stored past `initialize`, irrelevant afterward |
+| Payment signers | `smart_account` context rule `0` | `initial_signers`/`initial_policies` | **Yes** — owner-gated `add_signer`/`remove_signer`/`add_context_rule` etc. |
+| Guardians | `recovery_manager`'s guardian set | Not set by `deploy_account` at all — added in a follow-up step, §12.6 | **Yes** — recovery-admin-gated `add_guardian`/`propose_remove_guardian`, ~1 day activation/removal delay |
+| Executor (relayer) | `intent_registry.Executor` | `deploy_account`'s `executor` param (Tier 1) or `smart_account.initialize`'s `config.initial_executor` (Tier 2) | **Yes, but not trivially** — no `smart_account` passthrough exists; rotating it means a direct, fully custom-authorized call to `intent_registry.set_executor` — §12.7 |
+
+The practical consequence for the UI: **the Policy Admin and Recovery
+Admin fields need their own explicit, un-skippable confirmation step**,
+worded to make clear this choice is permanent — not a "connected wallet"
+default a user could click through without noticing. Everything else in
+this table has a real recovery path if the initial choice turns out
+wrong; these two do not.
+
+### 12.2 Two setup tiers
+
+`account_factory.deploy_account` forces a single `caller` address into
+*all three* of Owner, Policy Admin, and Recovery Admin at once — it has
+no parameters to set them independently (verified against
+`contracts/account_factory/src/lib.rs`: every sub-contract `initialize`
+call in `deploy_account` passes the same `caller`). That is a deliberate
+simplification in the contract itself (see that file's own module doc
+comment), not a bug, but it means true role separation at deploy time
+needs a different, longer path. Offer both:
+
+- **Tier 1 — Guided** (§12.3): one `account_factory.deploy_account` call,
+  one signature. `caller` becomes Owner + Policy Admin + Recovery Admin
+  together. Right default for an individual or a team comfortable with
+  one key holding all three admin roles (a very reasonable choice —
+  it's exactly what `docs/GOVERNANCE_MULTISIG_DESIGN.md` recommends
+  pointing at a `governance_account` multisig address rather than a
+  personal key, and `smart_account.owner` specifically can still move
+  later via §12.6).
+- **Tier 2 — Custom** (§12.4): the same six deploy-and-`initialize`
+  sequence `scripts/deploy_testnet.sh` already performs by hand, run
+  from the dApp instead — but with Owner, Policy Admin, and Recovery
+  Admin collected as three independently editable addresses in the UI.
+  Trades one signature for five or six (one per contract's own
+  `initialize`, since without `account_factory`'s single entry point
+  each call is its own transaction) in exchange for real separation of
+  duties from day one — e.g. a compliance address holding Policy Admin,
+  a distinct operations address holding Recovery Admin, and the actual
+  treasury owner holding Owner alone.
+
+Present this as a single up-front choice ("Quick setup" vs. "Custom role
+assignment"), not a per-field toggle — mixing tiers mid-flow only adds
+confusion, since Tier 1's whole value is collapsing six transactions into
+one.
+
+### 12.3 Tier 1 walkthrough
+
+Using the SDK's `account_factory` client (`sdk/packages/core/src/state.ts`'s
+`accountFactoryClient`) directly — `deploy_account`'s `caller.require_auth()`
+is a plain, root-level address requirement, not `smart_account`'s custom
+`AuthPayload`, so no `auth.ts` machinery is needed here, only an ordinary
+wallet signature. `sdk/examples/05-deploy-treasury-via-factory.ts`
+implements exactly this (with a raw `Keypair` in place of a connected
+wallet's signer):
+
+```ts
+import { accountFactoryClient, TESTNET } from "sta-sdk";
+
+const client = accountFactoryClient(TESTNET);
+client.options.publicKey = caller;              // from the connected wallet
+client.options.signTransaction = kit.signTransaction; // Stellar Wallets Kit
+
+const tx = await client.deploy_account({
+  caller,
+  salt: randomSalt32Bytes(),
+  initial_signers: [{ tag: "Delegated", values: [caller] }], // see §12.5 for multi-signer
+  initial_policies: new Map(),
+  guardian_threshold: 1,        // guardians themselves added in §12.6 -- this is only the number
+  executor,                     // a dedicated relayer key, NOT a human wallet -- see §12.1's row
+});
+const sent = await tx.signAndSend();
+const { smart_account, policy_engine, intent_registry, recovery_manager,
+        transfer_adapter, split_adapter } = sent.result.unwrap();
+```
+
+Persist the returned `DeployedAccount` addresses client-side (this is the
+treasury's own config now, distinct from the shared `TESTNET` snapshot in
+§2) and immediately continue into §12.6 — a freshly deployed treasury has
+policy rules that reject everything by default and zero guardians.
+
+### 12.4 Tier 2 walkthrough
+
+Same six calls `scripts/deploy_testnet.sh` makes, driven from the dApp
+with per-role addresses collected up front (`policyAdmin`,
+`recoveryAdmin`, `owner`, plus `initialSigners`/`guardianThreshold`/
+`executor` as in Tier 1). No `account_factory` involved — each
+`initialize` is deployed and called independently, so this needs the
+generated bindings for each contract individually
+(`sdk/generated/policy_engine`, `.../intent_registry`, etc. — already
+part of this SDK's package set). Order matters (`intent_registry` is
+deployed but left uninitialized until `smart_account.initialize`
+bootstraps it via the invoker-shortcut, same as Tier 1 — see that
+function's doc comment in `contracts/smart_account/src/lib.rs`):
+
+1. Deploy + `policy_engine.initialize(admin: policyAdmin)`.
+2. Deploy + `recovery_manager.initialize(admin: recoveryAdmin, guardian_threshold)`.
+3. Deploy `intent_registry` (uninitialized).
+4. Deploy `transfer_adapter`/`split_adapter` (their `admin` param can be
+   anyone, including the deployer itself — it's write-once and unused
+   afterward, per §12.1).
+5. Deploy + `smart_account.initialize(owner, initial_signers, initial_policies, config: { policy_engine, intent_registry, recovery_manager, initial_adapters, initial_executor })`.
+
+Each step is its own wallet-signed transaction; surface this transaction
+count in the UI up front ("Custom setup: 5–6 approvals") so it isn't a
+surprise partway through. A user abandoning the flow partway leaves
+orphaned, harmlessly-inert deployed-but-unwired contracts — no funds are
+ever at risk before step 5 completes, since nothing is funded yet.
+
+### 12.5 Multi-signer / weighted-threshold signers at deploy time
+
+Both tiers' `initial_signers`/`initial_policies` already support more
+than "one wallet, full control" — this is existing contract flexibility
+the deploy UI should expose directly, not a gap to design around:
+
+- **Single signer** (default, shown above): one `Signer::Delegated`,
+  `initial_policies` empty — any one registered signer can approve any
+  payment.
+- **N-of-M multisig**: multiple `Signer::Delegated` entries in
+  `initial_signers`, plus an OZ `weighted_threshold` (or
+  `simple_threshold`) policy in `initial_policies` keyed to the policy
+  contract's address — the treasury requires that many independent
+  wallet approvals (§5.4) before a payment's `AuthPayload` is considered
+  satisfied. Model this in the UI as "add a signer" (repeatable) + "how
+  many approvals are required" — the natural real-world mental model for
+  a team treasury — rather than exposing raw context-rule/policy
+  concepts to the end user.
+
+Additional signers/context rules can also be added after deployment
+(owner-gated `add_signer`/`add_context_rule`), so the deploy-time choice
+here is a starting point, not a permanent ceiling.
+
+### 12.6 Post-deploy setup wizard (both tiers converge here)
+
+A freshly deployed treasury is unusable until this runs — `policy_engine`
+starts with no asset/recipient/operation rules configured (every payment
+attempt fails closed), and no guardians are registered regardless of
+what `guardian_threshold` was set to.
+
+1. **Configure policy rules.** `policy_engine.set_asset_rule`,
+   `set_recipient_allowed`, `set_operation_allowed` — admin-gated, signed
+   by whoever holds Policy Admin (§12.1). This is the one piece of §12
+   that overlaps with policy *content* configuration, which §9 otherwise
+   still treats as ops tooling — narrowly in scope here only because a
+   treasury with zero rules configured cannot pay anyone at all.
+2. **Add guardians.** `recovery_manager.add_guardian(address)` per
+   guardian, admin-gated, signed by whoever holds Recovery Admin. Each
+   added guardian has a ~1 day activation delay
+   (`GUARDIAN_ACTIVATION_DELAY_LEDGERS`) before its approval counts
+   toward `guardian_threshold` — present this as "add guardians now, they
+   become active in about a day," not as a blocking step in the wizard.
+3. **Transfer ownership, if the bootstrap `caller`/`owner` was meant to
+   be temporary** (common in Tier 1: deploy with a throwaway/ops key,
+   then hand the treasury to its real owner). `smart_account
+   .transfer_ownership(new_owner, live_until_ledger)`, followed by the
+   new owner's own `accept_ownership()` call — a genuine two-step,
+   two-signature handoff (matches the OZ `Ownable` pattern used
+   throughout this workspace; neither the Policy Admin nor Recovery Admin
+   roles have an equivalent, per §12.1).
+4. **Rotate the executor, if needed** — §12.7.
+
+None of these four are required before the treasury can *receive* funds,
+only before it can *pay out* (step 1) or be protected by guardians
+(step 2) — a UI can let a user fund the treasury immediately after
+deployment while nudging them to finish setup, rather than gating the
+whole flow on all four completing.
+
+### 12.7 Rotating the executor after deploy
+
+Real friction worth designing around deliberately rather than
+discovering late: `smart_account` has **no** entrypoint that forwards to
+`intent_registry.set_executor` — every other cross-contract write this
+document covers goes *through* `smart_account` (§7's
+`create_scheduled_payment`, etc.), but executor rotation does not. A
+transaction calling `intent_registry.set_executor(new_executor)` directly
+still needs `smart_account`'s authorization (`intent_registry`'s admin is
+`smart_account` itself — set at bootstrap, §1), and since `smart_account`
+is not the *direct* caller of that transaction, the invoker-shortcut
+that would otherwise satisfy `intent_registry`'s admin check for free
+does not apply — this needs the full Entry A/Entry B `AuthPayload`
+construction from §5,
+just rooted at `intent_registry.set_executor` instead of a
+`smart_account` payment entrypoint. This SDK's `auth.ts` already supports
+an arbitrary root invocation for exactly this reason — no new tooling is
+needed, only a different `rootInvocation`:
+
+```ts
+import { buildInvocation, buildSmartAccountAuthEntries } from "sta-sdk";
+
+const rootInvocation = buildInvocation({
+  contractId: net.contracts.intentRegistry,
+  functionName: "set_executor",
+  args: [Address.fromString(newExecutor).toScVal()],
+});
+const [entryA, entryB] = await buildSmartAccountAuthEntries({
+  spec: smartAccountClient(net).spec,
+  smartAccountId: net.contracts.smartAccount,
+  rootInvocation,
+  signerAddress,           // current owner/signer authorizing this
+  sign,                    // wallet's signAuthEntry, or a Keypair
+  networkPassphrase: net.networkPassphrase,
+  signatureExpirationLedger,
+});
+// attach [entryA, entryB] to an intent_registry.set_executor(newExecutor)
+// operation built against the generated intent_registry client, then
+// simulate/sign the envelope/submit as usual (§6 steps 4–5).
+```
+
+Treat executor rotation as an owner-signed action in the UI (it needs a
+registered `smart_account` signer's approval, same authorization weight
+as a payment), not an admin action — the three admin roles in §12.1 have
+no say over it at all.

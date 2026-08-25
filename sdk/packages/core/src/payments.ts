@@ -25,6 +25,39 @@ import { buildExecutorAuthEntry, buildInvocation, buildSmartAccountAuthEntries }
 import type { NetworkConfig } from "./config.js";
 
 const DEFAULT_EXPIRATION_WINDOW_LEDGERS = 100;
+const POLL_INTERVAL_MS = 3000;
+const MAX_POLL_ATTEMPTS = 40; // ~2 minutes at POLL_INTERVAL_MS
+
+/**
+ * Builds, simulates, and returns a prepared `Transaction` invoking one
+ * contract function with a given set of auth entries already attached.
+ * Shared scaffolding for every `prepare*` helper below (signer-authored
+ * `smart_account` calls and the relayer's `execute_scheduled_payment`
+ * alike) -- only the auth entries and operation args actually differ
+ * between them. Takes an already-fetched `sourceAccount` rather than
+ * fetching it itself, so callers can build auth entries (a signing round
+ * trip, possibly a wallet prompt) and fetch the source account
+ * concurrently instead of serially.
+ */
+function buildAndPrepareTransaction(
+  server: rpc.Server,
+  net: NetworkConfig,
+  sourceAccount: Account,
+  contract: string,
+  functionName: string,
+  args: xdr.ScVal[],
+  auth: xdr.SorobanAuthorizationEntry[],
+): Promise<Transaction> {
+  const builder = new TransactionBuilder(sourceAccount, {
+    fee: BASE_FEE,
+    networkPassphrase: net.networkPassphrase,
+  })
+    .addOperation(Operation.invokeContractFunction({ contract, function: functionName, args, auth }))
+    .setTimeout(120)
+    .build();
+
+  return server.prepareTransaction(builder);
+}
 
 export interface PrepareOptions {
   net: NetworkConfig;
@@ -53,34 +86,32 @@ async function prepareSmartAccountCall(
     args,
   });
 
-  const [entryA, entryB] = await buildSmartAccountAuthEntries({
-    spec: opts.smartAccountClient.spec,
-    smartAccountId: opts.net.contracts.smartAccount,
-    rootInvocation,
-    signerAddress: opts.signerAddress,
-    sign: opts.sign,
-    networkPassphrase: opts.net.networkPassphrase,
-    contextRuleIds: opts.contextRuleIds,
-    signatureExpirationLedger,
-  });
+  // Neither depends on the other's result -- run the signing round trip
+  // (possibly a wallet prompt) and the account-fetch RPC call concurrently
+  // rather than paying both latencies serially.
+  const [[entryA, entryB], sourceAccount] = await Promise.all([
+    buildSmartAccountAuthEntries({
+      spec: opts.smartAccountClient.spec,
+      smartAccountId: opts.net.contracts.smartAccount,
+      rootInvocation,
+      signerAddress: opts.signerAddress,
+      sign: opts.sign,
+      networkPassphrase: opts.net.networkPassphrase,
+      contextRuleIds: opts.contextRuleIds,
+      signatureExpirationLedger,
+    }),
+    server.getAccount(opts.feeSourceAddress),
+  ]);
 
-  const sourceAccount = await server.getAccount(opts.feeSourceAddress);
-  const builder = new TransactionBuilder(sourceAccount, {
-    fee: BASE_FEE,
-    networkPassphrase: opts.net.networkPassphrase,
-  })
-    .addOperation(
-      Operation.invokeContractFunction({
-        contract: opts.net.contracts.smartAccount,
-        function: functionName,
-        args,
-        auth: [entryA, entryB],
-      }),
-    )
-    .setTimeout(120)
-    .build();
-
-  return server.prepareTransaction(builder);
+  return buildAndPrepareTransaction(
+    server,
+    opts.net,
+    sourceAccount,
+    opts.net.contracts.smartAccount,
+    functionName,
+    args,
+    [entryA, entryB],
+  );
 }
 
 export interface TransferPaymentArgs {
@@ -169,9 +200,18 @@ export async function signAndSubmit(
   console.log("submitted:", sendResponse.hash);
 
   let response = await server.getTransaction(sendResponse.hash);
-  while (response.status === rpc.Api.GetTransactionStatus.NOT_FOUND) {
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+  for (
+    let attempt = 0;
+    response.status === rpc.Api.GetTransactionStatus.NOT_FOUND && attempt < MAX_POLL_ATTEMPTS;
+    attempt++
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     response = await server.getTransaction(sendResponse.hash);
+  }
+  if (response.status === rpc.Api.GetTransactionStatus.NOT_FOUND) {
+    throw new Error(
+      `transaction ${sendResponse.hash} not found after ${MAX_POLL_ATTEMPTS} polling attempts`,
+    );
   }
   if (response.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
     throw new Error(`transaction ${sendResponse.hash} failed: ${JSON.stringify(response)}`);
@@ -200,34 +240,29 @@ export async function prepareRelayerExecution(opts: RelayerExecuteOptions): Prom
   const latestLedger = await server.getLatestLedger();
   const signatureExpirationLedger = latestLedger.sequence + DEFAULT_EXPIRATION_WINDOW_LEDGERS;
 
-  const executorEntry = await buildExecutorAuthEntry({
-    intentRegistryId: opts.net.contracts.intentRegistry,
-    intentId: opts.intentId,
-    childSequence: opts.childSequence,
-    executorAddress: opts.executorAddress,
-    sign: opts.sign,
-    networkPassphrase: opts.net.networkPassphrase,
-    signatureExpirationLedger,
-  });
+  const [executorEntry, sourceAccount] = await Promise.all([
+    buildExecutorAuthEntry({
+      intentRegistryId: opts.net.contracts.intentRegistry,
+      intentId: opts.intentId,
+      childSequence: opts.childSequence,
+      executorAddress: opts.executorAddress,
+      sign: opts.sign,
+      networkPassphrase: opts.net.networkPassphrase,
+      signatureExpirationLedger,
+    }),
+    server.getAccount(opts.executorAddress),
+  ]);
 
   const args = [xdr.ScVal.scvBytes(opts.intentId), xdr.ScVal.scvU32(opts.childSequence)];
-  const sourceAccount = await server.getAccount(opts.executorAddress);
-  const builder = new TransactionBuilder(sourceAccount, {
-    fee: BASE_FEE,
-    networkPassphrase: opts.net.networkPassphrase,
-  })
-    .addOperation(
-      Operation.invokeContractFunction({
-        contract: opts.net.contracts.smartAccount,
-        function: "execute_scheduled_payment",
-        args,
-        auth: [executorEntry],
-      }),
-    )
-    .setTimeout(120)
-    .build();
-
-  return server.prepareTransaction(builder);
+  return buildAndPrepareTransaction(
+    server,
+    opts.net,
+    sourceAccount,
+    opts.net.contracts.smartAccount,
+    "execute_scheduled_payment",
+    args,
+    [executorEntry],
+  );
 }
 
 export { Account };

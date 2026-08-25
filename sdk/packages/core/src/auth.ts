@@ -90,6 +90,38 @@ function randomNonce(): bigint {
   return (high << 32n) | low;
 }
 
+/**
+ * Builds and signs one ordinary classic-account `SorobanAuthorizationEntry`
+ * -- an `Address` credential whose signature is a real Ed25519 signature
+ * (via `authorizeEntry`), not a contract-defined payload like
+ * `smart_account`'s `AuthPayload`. Shared by Entry B of
+ * `buildSmartAccountAuthEntries` (the nested `__check_auth` call a
+ * `Signer::Delegated` wallet signs) and `buildExecutorAuthEntry` (the
+ * relayer's `mark_child_executed` authorization) -- both are the same
+ * mechanism pointed at a different invocation/address.
+ */
+async function buildClassicAuthEntry(
+  address: string,
+  invocation: xdr.SorobanAuthorizedInvocation,
+  sign: Keypair | SigningCallback,
+  signatureExpirationLedger: number,
+  networkPassphrase: string,
+): Promise<xdr.SorobanAuthorizationEntry> {
+  const nonce = randomNonce();
+  const unsignedEntry = new xdr.SorobanAuthorizationEntry({
+    credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(
+      new xdr.SorobanAddressCredentials({
+        address: new Address(address).toScAddress(),
+        nonce: xdr.Int64.fromString(nonce.toString()),
+        signatureExpirationLedger,
+        signature: xdr.ScVal.scvVoid(),
+      }),
+    ),
+    rootInvocation: invocation,
+  });
+  return authorizeEntry(unsignedEntry, sign, signatureExpirationLedger, networkPassphrase);
+}
+
 export interface BuildSmartAccountAuthOptions {
   /** `smart_account`'s own contract Spec (from its generated Client's
    * `.spec`) -- used to encode the `AuthPayload` struct correctly. */
@@ -169,21 +201,9 @@ export async function buildSmartAccountAuthEntries(
     functionName: "__check_auth",
     args: [xdr.ScVal.scvBytes(authDigest)],
   });
-  const nonceB = randomNonce();
-  const unsignedEntryB = new xdr.SorobanAuthorizationEntry({
-    credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(
-      new xdr.SorobanAddressCredentials({
-        address: new Address(opts.signerAddress).toScAddress(),
-        nonce: xdr.Int64.fromString(nonceB.toString()),
-        signatureExpirationLedger: opts.signatureExpirationLedger,
-        signature: xdr.ScVal.scvVoid(),
-      }),
-    ),
-    rootInvocation: nestedInvocation,
-  });
-
-  const entryB = await authorizeEntry(
-    unsignedEntryB,
+  const entryB = await buildClassicAuthEntry(
+    opts.signerAddress,
+    nestedInvocation,
     opts.sign,
     opts.signatureExpirationLedger,
     opts.networkPassphrase,
@@ -235,20 +255,9 @@ export async function buildExecutorAuthEntry(
     functionName: "mark_child_executed",
     args: [xdr.ScVal.scvBytes(opts.intentId), xdr.ScVal.scvU32(opts.childSequence)],
   });
-  const nonce = randomNonce();
-  const unsignedEntry = new xdr.SorobanAuthorizationEntry({
-    credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(
-      new xdr.SorobanAddressCredentials({
-        address: new Address(opts.executorAddress).toScAddress(),
-        nonce: xdr.Int64.fromString(nonce.toString()),
-        signatureExpirationLedger: opts.signatureExpirationLedger,
-        signature: xdr.ScVal.scvVoid(),
-      }),
-    ),
-    rootInvocation: invocation,
-  });
-  return authorizeEntry(
-    unsignedEntry,
+  return buildClassicAuthEntry(
+    opts.executorAddress,
+    invocation,
     opts.sign,
     opts.signatureExpirationLedger,
     opts.networkPassphrase,
