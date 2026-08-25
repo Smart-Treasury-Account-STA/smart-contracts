@@ -350,20 +350,46 @@ which requires the registry's configured `Executor` address
 not by the dApp) to satisfy `require_auth()`.
 
 Because `Executor` is a **plain Stellar account**, not `smart_account`,
-this does not need §5's custom `AuthPayload` machinery at all. The relayer:
+this does not need §5's custom `AuthPayload` machinery at all — but it
+does still need one explicit, signed authorization entry. **Correction to
+this section, found by actually running this against live testnet (both
+via the bare `stellar` CLI and via `@stellar/stellar-sdk ^14.5.0`) while
+building the SDK**: an earlier revision of this section claimed
+`prepareTransaction` auto-fills the nested `Executor` requirement as a
+`SOROBAN_CREDENTIALS_SOURCE_ACCOUNT` entry. It does not. `SourceAccount`
+auto-fill only covers a `require_auth()` at the ROOT of the invocation
+tree; `mark_child_executed`'s `executor.require_auth()` is two levels
+deep (`execute_scheduled_payment -> intent_registry.mark_child_executed
+-> ensure_executor`), so both the CLI and the JS SDK reject it with
+`Error(Auth, InvalidAction)` / "encountered authorization not tied to the
+root contract invocation for an address" unless an explicit entry is
+supplied. The relayer:
 
 1. Holds one ordinary keypair, configured as `Executor`.
-2. Sets that keypair as the transaction's **source account**.
+2. Sets that keypair as the transaction's **source account** (this part
+   was always correct — it pays the fee and is independent of the
+   authorization entry below).
 3. Builds and simulates
-   `smart_account.execute_transfer_payment`... no —
    `smart_account.execute_scheduled_payment(intent_id, child_sequence)` as
    the operation.
-4. `prepareTransaction` auto-fills the nested `Executor` requirement as a
-   `SOROBAN_CREDENTIALS_SOURCE_ACCOUNT` entry (satisfied implicitly by the
-   transaction envelope's own signature — no separate `AuthPayload` or
-   nonce/digest construction needed, unlike §5).
+4. Builds one explicit `SorobanAuthorizationEntry`, rooted directly at
+   `intent_registry.mark_child_executed(intent_id, child_sequence)` (not
+   at the outer `execute_scheduled_payment` call, since that's where the
+   real `require_auth()` fires), with the relayer's own address as a
+   classic (non-custom-account) credential. `@stellar/stellar-sdk`'s
+   `authorizeEntry(entry, signer, validUntilLedgerSeq, networkPassphrase)`
+   signs it the same way it signs §5's Entry B — no `AuthPayload`,
+   `context_rule_ids`, or nested-digest construction involved, since the
+   executor isn't a custom account. Attach this single entry to the
+   operation before calling `prepareTransaction` (which preserves it,
+   same as §5.3 step 7).
 5. Signs the transaction envelope with the relayer's own key and submits
    through the standard `@stellar/stellar-sdk` RPC flow.
+
+Reference implementation: `buildExecutorAuthEntry` /
+`prepareRelayerExecution` in `sdk/packages/core/src/auth.ts` and
+`payments.ts`, exercised end to end in
+`sdk/examples/04-scheduled-payment-create-and-relayer-execute.ts`.
 
 `child_sequence` is the relayer's own choice per execution attempt, but not
 an arbitrary one: sequences are 1-based (`0` is rejected outright with

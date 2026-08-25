@@ -1,0 +1,22 @@
+{
+  "name": "sta-sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for Smart Treasury Account: typed contract clients, transaction-preparation helpers, event parsing, and first-class policy-version/replay-state/recovery-state types.",
+  "type": "module",
+  "exports": "./dist/index.js",
+  "typings": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@sta/smart_account-bindings": "^0.1.0",
+    "@sta/policy_engine-bindings": "^0.1.0",
+    "@sta/intent_registry-bindings": "^0.1.0",
+    "@sta/recovery_manager-bindings": "^0.1.0",
+    "@sta/account_factory-bindings": "^0.1.0",
+    "@stellar/stellar-sdk": "^14.5.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.2"
+  }
+}
