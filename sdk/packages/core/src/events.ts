@@ -10,7 +10,7 @@
  * followed by any further `#[topic]`-tagged fields, then a data map of the
  * remaining fields keyed by their Rust field name.
  */
-import { xdr, scValToNative } from "@stellar/stellar-sdk";
+import { xdr, scValToNative, StrKey } from "@stellar/stellar-sdk";
 
 export interface TransferPaid {
   asset: string;
@@ -100,8 +100,8 @@ export interface EventMap {
 }
 
 export type ParsedEvent =
-  | { [K in keyof EventMap]: { topic: K; event: EventMap[K] } }[keyof EventMap]
-  | { topic: string; event: Record<string, unknown> };
+  | { [K in keyof EventMap]: { topic: K; event: EventMap[K]; contractId?: string } }[keyof EventMap]
+  | { topic: string; event: Record<string, unknown>; contractId?: string };
 
 function topicSymbol(event: xdr.ContractEvent): string | undefined {
   const body = event.body().v0();
@@ -109,15 +109,39 @@ function topicSymbol(event: xdr.ContractEvent): string | undefined {
   return first?.switch().name === "scvSymbol" ? first.sym().toString() : undefined;
 }
 
+/** The `C...` strkey address of the contract that emitted this event --
+ * `undefined` only if the host itself omitted it (not expected in
+ * practice). Use this to disambiguate topic symbols that are not unique
+ * across contracts -- see `TOPIC_FIELDS`'s doc comment on `"cancel"`. */
+function emittingContractId(event: xdr.ContractEvent): string | undefined {
+  const raw = event.contractId();
+  if (!raw) return undefined;
+  // `xdr.Hash`'s type declaration is `Opaque[]` -- the underlying
+  // `@stellar/stellar-base` types file labels this itself as "a
+  // workaround, cause unknown." At runtime it's a plain `Buffer`, same as
+  // every other fixed-size opaque XDR type in this SDK.
+  return StrKey.encodeContract(Buffer.from(raw as unknown as Buffer));
+}
+
 /** `#[contractevent]`'s `#[topic]`-tagged fields, beyond the topic symbol
  * itself, in declaration order -- these live in `topics[1..]`, not the
  * data map, and (unlike the data map) carry no field names on-chain, so
  * this ordering must match each event struct's actual field order in its
- * `src/lib.rs`. Topic symbols are not globally unique across contracts
- * (e.g. `intent_registry`'s `IntentCancelled` and `recovery_manager`'s
- * `RecoveryCancelled` both use `"cancel"`) -- this map only covers the
- * events in `EventMap`; a topic outside it decodes as the untyped
- * catch-all below regardless of which contract emitted it. */
+ * `src/lib.rs`.
+ *
+ * Topic symbols are **not** globally unique across contracts: both
+ * `intent_registry`'s `IntentCancelled` and `recovery_manager`'s
+ * `RecoveryCancelled` use `"cancel"`, with the same shape (one
+ * `BytesN<32>` topic field) but a different name (`intent_id` vs.
+ * `request_id`). This map only models the `intent_registry` meaning --
+ * an event from `recovery_manager` with topic `"cancel"` still matches
+ * this entry (it does **not** fall through to the untyped catch-all,
+ * despite what an earlier revision of this comment claimed) and gets
+ * labeled `intent_id` even though the underlying value is actually a
+ * `request_id`. The raw bytes are correct either way; only the field
+ * *name* can be wrong. `parseContractEvent` attaches `contractId` to
+ * every result specifically so a caller can check which contract
+ * actually emitted a `"cancel"` event before trusting this field's name. */
 const TOPIC_FIELDS: Record<keyof EventMap, string[]> = {
   pay_ok: ["asset", "destination"],
   splt_ok: ["asset"],
@@ -160,7 +184,7 @@ function decodeFields(event: xdr.ContractEvent): Record<string, unknown> {
 export function parseContractEvent(event: xdr.ContractEvent): ParsedEvent {
   const topic = topicSymbol(event);
   const fields = decodeFields(event);
-  return { topic: topic ?? "", event: fields } as ParsedEvent;
+  return { topic: topic ?? "", event: fields, contractId: emittingContractId(event) } as ParsedEvent;
 }
 
 /** Parses every event from a `getTransaction` response's

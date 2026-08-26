@@ -8,10 +8,15 @@
  * hand-deployed treasury from docs/TESTNET_DEPLOYMENT.md predates that fix
  * and is not the default here.
  *
- * `mainnet` is deliberately `undefined` -- no mainnet deployment exists yet.
- * Once one does, add an entry here with the same shape; nothing else in
- * this SDK assumes `testnet` specifically, every helper takes a
- * `NetworkConfig` as a parameter.
+ * `MAINNET` stays `undefined` until `buildMainnetConfig` is actually called
+ * with real, deployed contract addresses -- no mainnet deployment exists
+ * yet, and nothing here fabricates one. What *is* ready now is the rest of
+ * the mainnet shape: the real, verified mainnet network passphrase
+ * (`MAINNET_NETWORK_PASSPHRASE`, a fixed protocol constant, unlike an RPC
+ * URL) and `buildMainnetConfig` itself, so wiring in a real mainnet
+ * deployment later is "call this function with the six addresses," not a
+ * code change. Nothing else in this SDK assumes `testnet` specifically --
+ * every helper takes a `NetworkConfig` as a parameter.
  */
 
 export interface ContractAddresses {
@@ -49,7 +54,64 @@ export const TESTNET: NetworkConfig = {
   },
 };
 
-/** No mainnet deployment exists yet -- see this module's doc comment. */
+/**
+ * Stellar's mainnet (Public Network) passphrase -- a fixed protocol
+ * constant defined by the network itself, verified against
+ * https://developers.stellar.org/docs/encyclopedia/network-passphrases,
+ * not something that depends on which contracts (if any) are deployed.
+ * Safe to hardcode, unlike a mainnet RPC URL (see `buildMainnetConfig`).
+ */
+export const MAINNET_NETWORK_PASSPHRASE = "Public Global Stellar Network ; September 2015";
+
+/**
+ * Unlike testnet (SDF hosts `https://soroban-testnet.stellar.org` for
+ * free), SDF does **not** operate a free public mainnet Soroban RPC
+ * endpoint -- confirmed against https://developers.stellar.org/docs/data/apis/rpc/providers,
+ * which lists only third-party ecosystem providers (QuickNode, Ankr,
+ * Tatum, Blockdaemon, etc.) for mainnet. There is no single correct
+ * default to hardcode here, so `buildMainnetConfig` reads this env var
+ * instead of assuming a provider on your behalf -- set it to whichever
+ * provider's URL you've chosen, or pass `rpcUrl` to that function
+ * directly.
+ */
+export const MAINNET_RPC_URL_ENV = "STA_MAINNET_RPC_URL";
+
+/**
+ * Builds a mainnet `NetworkConfig` once the contracts are actually deployed
+ * there. No mainnet deployment exists yet (see docs/SDK_TESTNET_RELEASE.md)
+ * -- this function exists so the SDK is ready to receive real mainnet
+ * addresses the moment a deployment happens, not to fabricate one now.
+ * Do not pass testnet addresses here "to try it out" -- a `NetworkConfig`
+ * with `network: "mainnet"` and real fee-paying keys will submit real,
+ * fee-paying, fund-moving transactions against Stellar's production ledger.
+ *
+ * @param contracts The six real contract addresses from an actual mainnet
+ *   deployment record (mirroring how `TESTNET.contracts` above is sourced
+ *   from docs/TESTNET_FACTORY_DEPLOYMENT.md).
+ * @param rpcUrl Your chosen mainnet RPC provider's URL. Defaults to
+ *   `process.env[MAINNET_RPC_URL_ENV]`; throws if neither is supplied,
+ *   rather than silently falling back to some hardcoded provider.
+ */
+export function buildMainnetConfig(
+  contracts: ContractAddresses,
+  rpcUrl: string = process.env[MAINNET_RPC_URL_ENV] ?? "",
+): NetworkConfig {
+  if (!rpcUrl) {
+    throw new Error(
+      `Mainnet RPC URL not configured -- pass one explicitly to buildMainnetConfig, or set ${MAINNET_RPC_URL_ENV}. SDF hosts no free public mainnet endpoint; see https://developers.stellar.org/docs/data/apis/rpc/providers for ecosystem providers.`,
+    );
+  }
+  return {
+    network: "mainnet",
+    rpcUrl,
+    networkPassphrase: MAINNET_NETWORK_PASSPHRASE,
+    contracts,
+  };
+}
+
+/** `undefined` until `buildMainnetConfig` is actually called with real,
+ * deployed contract addresses -- see this module's doc comment and that
+ * function's. No mainnet deployment exists yet. */
 export const MAINNET: NetworkConfig | undefined = undefined;
 
 export const NETWORKS = {

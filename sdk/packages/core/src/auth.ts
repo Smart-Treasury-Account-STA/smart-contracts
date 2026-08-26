@@ -139,14 +139,20 @@ export interface BuildSmartAccountAuthOptions {
    * wallet's `signAuthEntry` (see docs/DAPP_INTEGRATION_SPEC.md §5.3). */
   sign: Keypair | SigningCallback;
   networkPassphrase: string;
-  /** Context rule id(s) the signer is registered under, one per auth
-   * context reaching `__check_auth` (root + any declared
-   * sub-invocation) -- see `docs/DAPP_INTEGRATION_SPEC.md` §5.2. Default:
-   * `[0]` (the founding rule), applied to every context. */
+  /** Context rule id(s) the signer is registered under -- **must have
+   * exactly one entry per auth context that reaches `__check_auth`**:
+   * one for `rootInvocation` itself, plus one more for each entry in
+   * `rootInvocation.subInvocations()` that also needs this signer's
+   * coverage (see `docs/DAPP_INTEGRATION_SPEC.md` §5.2). Every current
+   * caller in this SDK passes a `rootInvocation` with no sub-invocations
+   * (post finding-29 fix -- see `docs/SECURITY_REVIEW_STRICT.md` --
+   * every adapter call is invoker-shortcut-satisfied, so nothing needs
+   * declaring here), so the default of `[0]` (one entry, the founding
+   * rule) is correct for all of them; a caller that *does* pass
+   * sub-invocations must size this array to match or the resulting
+   * `context_rule_ids` will under-cover the tree and the call will fail
+   * on-chain. Default: `[0]`. */
   contextRuleIds?: number[];
-  /** How many auth contexts this entry covers (root + sub-invocations).
-   * Default: 1 (root only). */
-  authContextCount?: number;
   signatureExpirationLedger: number;
 }
 

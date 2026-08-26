@@ -86,22 +86,28 @@ async function prepareSmartAccountCall(
     args,
   });
 
-  // Neither depends on the other's result -- run the signing round trip
-  // (possibly a wallet prompt) and the account-fetch RPC call concurrently
-  // rather than paying both latencies serially.
-  const [[entryA, entryB], sourceAccount] = await Promise.all([
-    buildSmartAccountAuthEntries({
-      spec: opts.smartAccountClient.spec,
-      smartAccountId: opts.net.contracts.smartAccount,
-      rootInvocation,
-      signerAddress: opts.signerAddress,
-      sign: opts.sign,
-      networkPassphrase: opts.net.networkPassphrase,
-      contextRuleIds: opts.contextRuleIds,
-      signatureExpirationLedger,
-    }),
-    server.getAccount(opts.feeSourceAddress),
-  ]);
+  // Deliberately sequential, not `Promise.all`'d with `getAccount`: `sign`
+  // may be a `SigningCallback` forwarding to a connected wallet's
+  // `signAuthEntry` (docs/DAPP_INTEGRATION_SPEC.md §5.3), which can take
+  // an arbitrary, human-scale amount of time to resolve (the user has to
+  // actually approve it). Fetching `feeSourceAddress`'s account -- and
+  // therefore its sequence number -- before that resolves would widen the
+  // window in which some other transaction from that same account could
+  // land and make the fetched sequence number stale by the time this
+  // transaction is actually built and submitted, causing an otherwise
+  // avoidable `txBAD_SEQ` failure. Fetching it only after signing
+  // completes keeps that window as small as possible.
+  const [entryA, entryB] = await buildSmartAccountAuthEntries({
+    spec: opts.smartAccountClient.spec,
+    smartAccountId: opts.net.contracts.smartAccount,
+    rootInvocation,
+    signerAddress: opts.signerAddress,
+    sign: opts.sign,
+    networkPassphrase: opts.net.networkPassphrase,
+    contextRuleIds: opts.contextRuleIds,
+    signatureExpirationLedger,
+  });
+  const sourceAccount = await server.getAccount(opts.feeSourceAddress);
 
   return buildAndPrepareTransaction(
     server,
@@ -240,18 +246,20 @@ export async function prepareRelayerExecution(opts: RelayerExecuteOptions): Prom
   const latestLedger = await server.getLatestLedger();
   const signatureExpirationLedger = latestLedger.sequence + DEFAULT_EXPIRATION_WINDOW_LEDGERS;
 
-  const [executorEntry, sourceAccount] = await Promise.all([
-    buildExecutorAuthEntry({
-      intentRegistryId: opts.net.contracts.intentRegistry,
-      intentId: opts.intentId,
-      childSequence: opts.childSequence,
-      executorAddress: opts.executorAddress,
-      sign: opts.sign,
-      networkPassphrase: opts.net.networkPassphrase,
-      signatureExpirationLedger,
-    }),
-    server.getAccount(opts.executorAddress),
-  ]);
+  // Sequential for the same reason as `prepareSmartAccountCall` above:
+  // `opts.sign` may be a slow `SigningCallback` (e.g. an HSM-backed
+  // relayer signer), and fetching the source account's sequence number
+  // only after it resolves keeps the staleness window minimal.
+  const executorEntry = await buildExecutorAuthEntry({
+    intentRegistryId: opts.net.contracts.intentRegistry,
+    intentId: opts.intentId,
+    childSequence: opts.childSequence,
+    executorAddress: opts.executorAddress,
+    sign: opts.sign,
+    networkPassphrase: opts.net.networkPassphrase,
+    signatureExpirationLedger,
+  });
+  const sourceAccount = await server.getAccount(opts.executorAddress);
 
   const args = [xdr.ScVal.scvBytes(opts.intentId), xdr.ScVal.scvU32(opts.childSequence)];
   return buildAndPrepareTransaction(

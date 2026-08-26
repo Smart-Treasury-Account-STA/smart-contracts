@@ -7,7 +7,7 @@
     "generated/*"
   ],
   "scripts": {
-    "build": "npm run build --workspaces --if-present"
+    "build": "npm run build --workspace=generated/smart_account --workspace=generated/policy_engine --workspace=generated/intent_registry --workspace=generated/recovery_manager --workspace=generated/account_factory --if-present && npm run build --workspace=packages/core --if-present"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
