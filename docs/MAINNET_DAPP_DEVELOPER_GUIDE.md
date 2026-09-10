@@ -40,7 +40,7 @@ Call `deploy_account(caller, salt, initial_signers, initial_policies, guardian_t
 
 **Owner / founding signer (context rule 0):** `GAHNF7XS5D2YLNK3PPW5DVEDJDKVEE5NJ6POQVMM36HODCNVALTSNIY7` — a single key for now (no multisig `governance_account` on this beta treasury). **Do not treat this as a production-secure key** — its recovery phrase has been exposed in an internal chat session and should be considered non-confidential; this treasury is for integration testing, not for holding real value long-term.
 
-**Executor (relayer role for scheduled payments):** same address as owner, for now — reassignable any time via `intent_registry.set_executor`, rooted with `smart_account`'s own auth (see `docs/DAPP_INTEGRATION_SPEC.md` §12.7).
+**Executor (relayer role for scheduled payments):** `GCCPEHVEREZWAZ4W63HZLBLAO2IKNLDXX5NZNYXIWH4ZNBY7KZOULIN6` — the dApp's real relayer key, rotated from the deployment key on 2026-09-10 (see `docs/MAINNET_TESTING_TRANSACTIONS.md` #16). Reassignable any time via `intent_registry.set_executor`, rooted with `smart_account`'s own auth (see `docs/DAPP_INTEGRATION_SPEC.md` §12.7) — **not** an admin action and **not** limited to deploy-time, despite `smart_account` having no dedicated wrapper entrypoint for it.
 
 **Enabled today** (via `policy_engine`): `transfer` and `split` operations; XLM (cap 50/transfer) and USDC (cap 1/transfer); three allow-listed recipients (ask if you need a new one added — it's a single admin call, cheap and fast). A second context rule (`id 1`, scoped `CallContract(transfer_adapter)`) also exists on this treasury, for reference on how scoped rules look in practice — treat rule `0` as the one that matters for anything not specific to `transfer_adapter`.
 
