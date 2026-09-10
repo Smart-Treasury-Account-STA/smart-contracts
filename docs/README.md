@@ -13,6 +13,12 @@ This folder documents the current **V1 implementation** in `contracts/`. Everyth
 7. **[`GOVERNANCE_MULTISIG_DESIGN.md`](GOVERNANCE_MULTISIG_DESIGN.md)** — design notes (not implemented) for distributing the admin/owner role itself across multiple keys, the one item from the review above left as a named V1 boundary rather than fixed.
 8. **[`DAPP_INTEGRATION_SPEC.md`](DAPP_INTEGRATION_SPEC.md)** — how a client (the Tranche 2 dApp and scheduled-payment relayer) connects to these deployed contracts: wallet integration, reading treasury state, and — the one genuinely nonstandard piece — constructing `smart_account`'s custom authorization payload for payments and scheduled-payment creation.
 
+## Mainnet
+
+9. **[`MAINNET_DEPLOYMENT.md`](MAINNET_DEPLOYMENT.md)** — the live mainnet setup record: identities, the WASM hashes uploaded (§3), the shared `account_factory` (§4), the example treasury it deployed (§5), and the policy configuration applied. Rebuild and compare the hashes yourself with `scripts/verify_build.sh` (§3.1).
+10. **[`MAINNET_TESTING_TRANSACTIONS.md`](MAINNET_TESTING_TRANSACTIONS.md)** — every real transaction executed against that treasury, with hashes, explorer links, and what each proves — including the live "policy-less rule requires unanimous signers" lockout.
+11. **[`MAINNET_DAPP_DEVELOPER_GUIDE.md`](MAINNET_DAPP_DEVELOPER_GUIDE.md)** — what a dApp or SDK consumer needs to integrate against mainnet: network config, every contract address, the XLM/USDC asset contracts, what is enabled today, and a cost note on uploading new contract code.
+
 ## Not part of the current review
 
 - **[`archive/`](archive/)** — the earlier partial PoC's testnet deployment record, kept only for historical traceability. Different contract names, different `soroban-sdk` version, no OpenZeppelin composition. If you're reviewing V1, you can skip this folder entirely.
@@ -25,5 +31,6 @@ This folder documents the current **V1 implementation** in `contracts/`. Everyth
 | "How do I run the tests and check coverage?" | `V1_REVIEW_GUIDE.md` → Verification Commands |
 | "Which contract implements module X?" | `SMART_CONTRACT_SPECIFICATION.md` §1.1 |
 | "Is this deployed anywhere I can check independently?" | `TESTNET_DEPLOYMENT.md` |
+| "Where is the mainnet deployment, and can I reproduce its WASM hashes?" | `MAINNET_DEPLOYMENT.md`, then `scripts/verify_build.sh` |
 | "What's deliberately not built yet, and why?" | `V1_SCOPE.md` → Not Yet Included in V1 |
 | "How does the dApp/relayer actually connect to these contracts?" | `DAPP_INTEGRATION_SPEC.md` |

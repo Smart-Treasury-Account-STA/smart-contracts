@@ -2,7 +2,7 @@
 
 This is the live record of deploying `contracts/account_factory` and a first
 example treasury to Stellar **mainnet** (Public Network), on branch
-`mainnet`, using `stellar 26.0.0`, `soroban-sdk 26.1.0`,
+`main`, using `stellar 26.0.0`, `soroban-sdk 26.1.0`,
 `Public Global Stellar Network ; September 2015`.
 
 This deployment deliberately mirrors `docs/TESTNET_FACTORY_DEPLOYMENT.md`'s
@@ -36,7 +36,7 @@ is complete.
 ## 3. WASM hashes uploaded
 
 All six contracts were built via `stellar contract build --optimize` from
-this repo's current source (branch `mainnet`, based on
+this repo's current source (branch `main`, based on
 `feat/governance-account-and-security-hardening`) and uploaded individually
 so `account_factory` can reference them by hash:
 
@@ -60,6 +60,56 @@ XLM** (exact, verified via Horizon — see the per-transaction costs in
 contract *instance* from an already-uploaded hash (what every subsequent
 `deploy_account` call does) costs only ≈0.02–0.4 XLM — cheap, because it
 writes a tiny fraction of the bytes a fresh code upload does.
+
+### 3.1 Reproducing these hashes
+
+The hash Stellar assigns to uploaded WASM is the SHA-256 of the file, so
+"reproducible" means: build from this commit and get these exact bytes.
+`scripts/verify_build.sh` automates the comparison (it reads the table above
+as its expected values; `--fixtures-only` checks the six committed
+`contracts/account_factory/src/wasm_fixtures/` without building, `--container`
+rebuilds in the reference environment, `--wasm-dir` compares any build
+output). What that reproduction depends on, measured on 2026-09-09:
+
+| Environment | Matches |
+|---|---|
+| GitHub Actions `ubuntu-latest` (x86_64), Rust 1.94.1, stellar-cli 26.0.0 built by `cargo +1.96.0 install --locked` — `.github/workflows/ci.yml` on this commit, run 34246998029 | 6 / 6 fixtures byte for byte (the CI staleness check) |
+| macOS arm64, Rust 1.94.1, stellar-cli 26.0.0 — built the same way **or** the official release binary (identical output) | 5 / 7 (`recovery_manager`, `smart_account` differ inside the code section, identical meta) |
+| Linux arm64 container, Rust 1.94.1, stellar-cli 26.0.0 release binary | 2 / 7 (`transfer_adapter`, `account_factory`) |
+| linux/amd64 container mirroring `ci.yml` (`scripts/verify_build.sh --container`) | not runnable from the Apple Silicon machine used here: qemu-user emulation of amd64 crashes `rustc`. Needs a native x86_64 host or a Rosetta-enabled runtime. |
+| linux/arm64 container, same recipe (`CONTAINER_PLATFORM=linux/arm64`), stellar-cli 26.0.0 compiled from source | not completed here either: the local container VM has 2 GiB of memory and `rustc` is SIGKILLed compiling stellar-cli's `stellar-xdr` crate even with `CONTAINER_JOBS=1`. The recipe needs a VM with more memory. |
+| macOS arm64, Rust 1.94.1, stellar-cli **28.0.0** | 0 / 7 — every size identical, only the `cliver` meta entry differs |
+
+Two things follow. First, the stellar CLI version is part of the artifact:
+`stellar contract build` writes it into the `cliver` contract-meta entry
+(`stellar contract info meta --wasm <file>`), so 26.0.0 exactly is required
+and the script refuses any other version. Before this note the version was
+pinned only by `ci.yml`'s install step and never stated as a reproducibility
+requirement (the docs site lists "Rust: stable"). Second, with the CLI
+version held fixed the output still depends on the host the build runs on,
+and the divergence is not confined to one stage: the same 26.0.0, whether
+installed from source or as the release binary, yields identical bytes on
+one host and different bytes on another OS/architecture. Comparing the
+**unoptimized** output (`stellar contract build` without `--optimize`, i.e.
+what `rustc` 1.94.1 emits) between macOS/arm64 and linux/arm64 already shows
+five of nine crates differing (`smart_account`, `policy_engine`,
+`intent_registry`, `split_adapter`, `governance_account`) — so part of it is
+compiler codegen; and `recovery_manager`, identical before optimization on
+both, differs from the deployed bytes after it — so part of it is
+`wasm-opt`. Every difference observed is inside the code section with
+identical meta and, for six of seven contracts, identical size: equivalent
+code, not identical bytes. Rust 1.94.1, soroban-sdk 26.1.0, and the
+release profile (`Cargo.toml`) are pinned by the repository; the host is
+pinned only by the CI recipe (`ubuntu-latest`, x86_64). That recipe is
+therefore the reference environment: `scripts/verify_build.sh --container`
+follows `ci.yml` step for step in a linux/amd64 container and is expected
+to reproduce all seven hashes, but this has not yet been demonstrated from
+an arm64 machine (see the table); the CI workflow on this commit has
+demonstrated the six fixtures.
+
+`account_factory` (not a committed fixture) was reproduced from macOS by the
+source-built 26.0.0, so every recorded hash has been rebuilt from source at
+least once outside CI.
 
 `webauthn_verifier` was **not** deployed — it is stateless and only needed
 if a treasury registers a passkey (`Signer::External`) signer; this

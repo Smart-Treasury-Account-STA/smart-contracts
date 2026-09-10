@@ -1,5 +1,15 @@
 # Smart Contract V1 Scope
 
+> **See also (this document predates Tranches 2 and 3).** The "Not Yet
+> Included in V1" items below that name a TypeScript SDK, a production dApp,
+> a relayer, and a mainnet deployment have since been built: the SDK is
+> published as [`sta-sdk`](https://github.com/Smart-Treasury-Account-STA/sdk)
+> on npm, the dApp and its scheduled-payment relayer live in the
+> [`dApp`](https://github.com/Smart-Treasury-Account-STA/dApp) repository, and
+> the contracts are deployed to mainnet — see `MAINNET_DEPLOYMENT.md`,
+> `MAINNET_TESTING_TRANSACTIONS.md`, and `MAINNET_DAPP_DEVELOPER_GUIDE.md` in
+> this folder. Everything else here still describes the contracts as they are.
+
 ## Purpose
 
 This document describes the scope of the current onchain implementation and directly addresses the review notes raised on the earlier PoC revision:

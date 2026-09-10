@@ -15,7 +15,7 @@ unchanged to mainnet; only the addresses and network config below differ.
 | RPC | No free SDF-hosted mainnet RPC exists. This deployment used `https://soroban-rpc.mainnet.stellar.gateway.fm`, confirmed working, but pick your own provider for production (QuickNode, Ankr, Tatum, Blockdaemon, etc. — see https://developers.stellar.org/docs/data/apis/rpc/providers). Two independent providers were cross-checked during this deployment and returned identical results. |
 | Horizon | `https://horizon.stellar.org` (SDF-hosted, free, standard) |
 
-The SDK's `sdk/packages/core/src/config.ts` already has `buildMainnetConfig(contracts, rpcUrl)` ready for exactly this — call it with the addresses below once you've picked an RPC provider.
+The published SDK ([`sta-sdk`](https://github.com/Smart-Treasury-Account-STA/sdk) on npm, `>=0.2.0`) ships every address below as `MAINNET_CONTRACTS` and `MAINNET_ASSETS`: `mainnet(rpcUrl)` (or `STA_MAINNET_RPC_URL` in the environment, plus `STA_MAINNET_RPC_HEADERS` as a JSON object if your provider takes an API key by header) returns a ready `NetworkConfig` for the example treasury, and `buildMainnetConfig(contracts, rpcUrl)` does the same for a treasury you deployed yourself through the factory. `examples/read-treasury.ts` there reads the example treasury's state with no keys — run it first. (This repository's own `sdk/` directory is a separate, unpublished SDK built on generated bindings and `@stellar/stellar-sdk` 14 — not what npm serves; integrate against `sta-sdk`.)
 
 ## 2. Factory contract (for deploying additional treasuries)
 
